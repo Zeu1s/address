@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example v2.0.9
+        description: Release version, for example v2.1.0
         required: true
-        default: v2.0.9
+        default: v2.1.0
 
 permissions:
   contents: read
@@ -114,28 +114,28 @@ jobs:
         run: |
           version='${{ steps.version.outputs.value }}'
           cat > release/RELEASE_NOTES.md <<'NOTES'
-          ### Administrator console
-          - Redesigned the console with a grouped sidebar, collapsible navigation, a light glass theme, local country flags, and in-app confirmation dialogs.
-          - Replaced the separate sync queue with an address data workspace: status filters, search, sorting, completion-rule badges, and per-country detail tabs for overview, targets, nodes, sources, and history.
-          - The overview and country list now show administrative coverage (nodes with addresses) separately from nodes that meet the per-node minimum, matching the completion rules.
-          - Added a system status endpoint, visibility-aware polling, and login rate limiting.
+          ### Address data and sources
+          - Assigns missing districts and cities from official or open boundary polygons (COD-AB, IBGE, admdongkor, Overture divisions and others) without overwriting source values; low-volume countries use a city-level contract.
+          - Added a Nigeria Geofabrik extract, Brazil and Singapore Overture addresses, and US Overture state partitions with USA Structures residential evidence.
+          - Address rules follow local conventions: China publishes communities with road and house number optional, and an unverifiable postcode outside China is left empty instead of rejecting the address.
+          - Fills missing postcodes from Census ZCTA and ABS POA boundaries, unique GeoNames places, Taiwan township zones and the China district catalog, including province-administered districts.
+          - Rejects placeholder street names, conversational or transliterated Chinese translations, and source text whose characters were lost; rejected rows are retired for retranslation.
+          - Taiwan names use the official 臺 form; the China city catalog restores truncated names and moves Jiangsu cities filed under Taiwan back to Jiangsu.
 
-          ### OpenAI-compatible translation
-          - Accepts a base URL prefix or the full `/chat/completions` URL, previews the actual request URL, and detects the API version on save.
-          - New providers start with the built-in default prompt, which can be restored in one click.
-          - Added a step-by-step test console that shows the request URL, model, parameters, HTTP status, latency, token usage, model reply, and the provider's error message with keys masked.
-          - Credentials marked for review can be tested again and return to service when a test passes; malformed model replies no longer mark a credential for review.
-          - Reasoning models get a 120-second deadline that includes broker queueing, so slow but healthy providers are no longer cancelled at 30 seconds.
-          - Added an unlimited quota option, which is the default for new OpenAI-compatible credentials.
+          ### Translation and publication
+          - Each provider credential has an adjustable concurrency, and translation backfill sends requests in parallel within each route's limit.
+          - Publication takes row locks only and updates generation ranks incrementally, so large backlogs publish about 90 times faster.
+          - Below-target countries are translated and published first; ordinary addresses publish before their Chinese street name is translated.
 
           ### Synchronization and deployment
-          - The sync service publishes its queue snapshot to PostgreSQL, so the console stays responsive while synchronization is busy.
-          - Migration retries residential coverage lock timeouts with bounded backoff instead of failing the deployment.
-          - The live contract audit accepts the official Hong Kong place-name character 涌.
+          - Country targets up to one billion addresses, with a storage budget that stops at a 10 GiB free-disk floor.
+          - Sync history credits each run only with its own import; failed runs show no growth, and runs interrupted by a restart or deploy are recorded as interrupted instead of staying running.
+          - Large imports no longer time out: finalization writes only changed rows and an evidence index is built concurrently at startup.
+          - Production activation runs detached, waits for the running sync job, and removes images of pruned releases and stale build cache.
+          - The public generator renders the first address without a loading pass and serves country counts from the admin coverage snapshot.
 
-          ### Documentation and verification
-          - Rewrote the README, deployment, API, API key, and development guides in English, Simplified Chinese, and Traditional Chinese, with Docker Compose first and new screenshots.
-          - Verified 1,420 JavaScript/TypeScript tests, 109 Python tests, type checks, builds, administrator and UI end-to-end tests, and 500 live address-contract samples for each of the 27 supported countries.
+          ### Verification
+          - Verified 1,508 JavaScript/TypeScript tests, 108 Python tests, type checks, builds, and 500 live address-contract samples for each of the 27 supported countries.
           NOTES
       - name: Publish stable GitHub release
         shell: bash
