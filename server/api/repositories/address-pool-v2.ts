@@ -682,7 +682,9 @@ export const pickNearestAddressPoolV2Address = async (
   const baseBindings: unknown[] = [country];
   if (residential) clauses.push(`property_type IN ('residential','apartment')`, 'residential_evidence = 1');
   const longitudeScale = Math.max(0.1, Math.cos(coordinates.latitude * Math.PI / 180));
-  const radii = [...new Set([Math.min(25, maximumDistanceKm), maximumDistanceKm])].filter((radius) => radius > 0);
+  // Every row inside the box is read and sorted, and a 25 km box in a dense city holds tens of thousands of rows,
+  // so the search widens step by step and stops at the first radius that has candidates.
+  const radii = [...new Set([2, 8, 25, maximumDistanceKm].map((radius) => Math.min(radius, maximumDistanceKm)))].filter((radius) => radius > 0);
 
   try {
     for (const radiusKm of radii) {

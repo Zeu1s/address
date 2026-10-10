@@ -525,6 +525,29 @@ describe('source-backed translation recovery', () => {
     expect(await database.prepare('SELECT attempts FROM translation_recovery').first('attempts')).toBe(1);
   });
 
+  it('keeps waiting through a Google cooldown on the final attempt and translates after the reset', async () => {
+    const outage = vi.fn(async () => { throw new Error('fixture outage'); });
+    for (let index = 0; index < 3; index += 1) {
+      await writeBackfillProgress(database, 'providers', { googleFailures: 0, googleRetryAt: null }, now());
+      await runTranslationBackfillBatch({ database, environment: {}, fetchImpl: outage,
+        now: () => new Date(now().getTime() + index * 600_000) });
+    }
+    expect(outage).toHaveBeenCalledTimes(3);
+    expect(await database.prepare('SELECT status,attempts,reason FROM translation_recovery').first())
+      .toEqual({ status: 'waiting', attempts: 2, reason: 'google_cooldown' });
+    expect((await runTranslationBackfillBatch({ database, environment: {}, fetchImpl: translate,
+      now: () => new Date(now().getTime() + 3_600_000) })).updated).toBe(1);
+  });
+
+  it('retries rows that earlier releases stored as terminal Google cooldown failures', async () => {
+    await runTranslationBackfillBatch({ database, environment: {}, fetchImpl: vi.fn(async () => new Response('', { status: 429 })), now });
+    await database.exec(`UPDATE translation_recovery SET status='failed',attempts=3,reason='google_cooldown',next_attempt_at=NULL`);
+    await writeBackfillProgress(database, 'providers', { googleFailures: 0, googleRetryAt: null }, now());
+    expect((await runTranslationBackfillBatch({ database, environment: {}, fetchImpl: translate,
+      now: () => new Date(now().getTime() + 600_000) })).updated).toBe(1);
+    expect(await database.prepare('SELECT status FROM translation_recovery').first('status')).toBe('complete');
+  });
+
   it('bounds repeated publication statement timeouts without spending cached provider requests', async () => {
     let failures = 0;
     vi.spyOn(database, 'transaction').mockImplementation(async () => {

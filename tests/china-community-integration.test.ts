@@ -118,6 +118,20 @@ describe('China community storage integration', () => {
     expect(empty.status).toBe(404);
   });
 
+  it('generates near a Chinese IP whose location is named in English', async () => {
+    const service = new ChinaDataService(addressDb, control);
+    await processCandidate(service, { ...candidate('amap', 'ip-nearby', '文化路18号'), postcode: '064000' });
+    vi.stubGlobal('fetch', async () => Response.json({
+      country_code: 'CN', region: 'Hebei Sheng', region_code: 'HE', city: 'Tangshan', postal: '063000', latitude: 39.84, longitude: 118.17
+    }));
+    const env = { ADDRESS_DB: addressDb, LOCATION_DB: addressDb, IP_GEOLOCATION_API_URL: 'https://ip.test/{ip}', IP_GEOLOCATION_FALLBACK_API_URL: '' };
+    const response = await app.request('/api/v1/generate?mode=ip-region&ip=1.24.0.1&strategy=instant', {}, env);
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(payload.data).toMatchObject({ country: 'CN', ipMatchLevel: 'coordinate' });
+    expect(payload.data.result.address.components).toMatchObject({ admin1: '河北省', locality: '唐山市', district: '丰润区' });
+  });
+
   it('generates from a district alone instead of resolving an unrelated catalog city', async () => {
     const service = new ChinaDataService(addressDb, control);
     await processCandidate(service, { ...candidate('amap', 'district-only', '文化路18号'), postcode: '064000' });

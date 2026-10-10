@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from 'react';
 import { Activity, Bookmark, ChevronDown, X } from 'lucide-react';
 import AmapPreview from './AmapPreview';
 import {
@@ -399,9 +399,13 @@ export default function App({ locale, apiBaseUrl }: AppProps) {
   const [copied, setCopied] = useState('');
   const [fallbackNotice, setFallbackNotice] = useState('');
   const [copyToast, setCopyToast] = useState<{ kind: 'success' | 'error'; message: string } | null>(null);
-  // Render at once from the last known availability (or every country); the live list replaces it when it arrives.
-  const [residentialCountries, setResidentialCountries] = useState<Set<CountryCode>>(() =>
-    (typeof window === 'undefined' ? null : storedAvailability()) || new Set(countries.map((country) => country.code)));
+  // Hydrate with every country, as the server rendered, then apply the last known availability before the first
+  // paint; the live list replaces it when it arrives.
+  const [residentialCountries, setResidentialCountries] = useState<Set<CountryCode>>(() => new Set(countries.map((country) => country.code)));
+  useLayoutEffect(() => {
+    const stored = storedAvailability();
+    if (stored) { residentialCountriesRef.current = stored; setResidentialCountries(stored); }
+  }, []);
   const [countriesReady, setCountriesReady] = useState(true);
   const [mapDisplay, setMapDisplay] = useState<MapDisplayConfig | null>(null);
   const [shortcutConfigs, setShortcutConfigs] = useState<Partial<Record<CountryCode, CountryShortcutConfig>>>({});

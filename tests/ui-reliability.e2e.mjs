@@ -271,7 +271,7 @@ try {
   const monitorCountry = { key: 'US', countryCode: 'US', level: 0, levelLabel: 'Country', regionCode: '',
     regionName: 'United States', residentialCount: 12, totalCount: 12, childCount: 1, updatedAt: '2026-01-01' };
   const monitorData = { nodes: [monitorCountry], countries: [monitorCountry], metrics: {
-    countryCount: 1, residentialTotal: 12, coveredLowest: 1, totalLowest: 2, coverageRate: .5, lastUpdatedAt: '2026-01-01' } };
+    countryCount: 1, addressTotal: 20, residentialTotal: 12, coveredLowest: 1, totalLowest: 2, coverageRate: .5, lastUpdatedAt: '2026-01-01' } };
   await check('continuation: monitor timeout offers an in-place retry', async (page) => {
     let fail = true;
     await page.addInitScript(() => { const timeout = AbortSignal.timeout.bind(AbortSignal); AbortSignal.timeout = () => timeout(80); });
@@ -443,11 +443,9 @@ try {
       return box.top >= list.top - 1 && box.bottom <= list.bottom + 1;
     }), true);
     await popup.getByRole('button', { name: 'Load more', exact: true }).click();
-    await popup.getByRole('option', { name: 'Synthetic City 400 1', exact: true }).waitFor();
+    await popup.getByText('400 / 400').waitFor();
     assert.ok(await popup.getByRole('option').count() <= 201);
-    await popup.getByRole('button', { name: 'Previous page', exact: true }).click();
-    await popup.getByRole('option', { name: 'Synthetic City 1 1', exact: true }).waitFor();
-    await popup.getByRole('button', { name: 'Next page', exact: true }).click();
+    await input.fill('City 400');
     await popup.getByRole('option', { name: 'Synthetic City 400 1', exact: true }).click();
     assert.equal(await input.inputValue(), 'Synthetic City 400');
     assert.equal(await popup.count(), 0);

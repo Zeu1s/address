@@ -9,7 +9,7 @@ const healthDatabase = ({ low = false }: { low?: boolean } = {}) => {
       const statement = {
         bind() { return statement; },
         async all() {
-          if (sql.includes('FROM sync_country_state')) {
+          if (sql.includes('FROM admin_coverage_stats')) {
             return { results: [
               { country_code: 'US', total: 20, residential: 12 },
               { country_code: 'JP', total: 16, residential: 9 }
@@ -54,9 +54,10 @@ describe('data health hot-pool readiness', () => {
       },
       configurationErrors: []
     });
-    const countQuery = statements.find((sql) => sql.includes('FROM sync_country_state'));
-    expect(countQuery).toContain('address_count AS total');
+    const countQuery = statements.find((sql) => sql.includes('FROM admin_coverage_stats'));
+    expect(countQuery).toContain('total_count AS total');
     expect(countQuery).toContain('residential_count AS residential');
+    expect(statements.join('\n')).not.toMatch(/COUNT\(\*\)[^]*FROM (address_pool|address_generation_index)\b/u);
     expect(statements.find((sql) => sql.includes('ready_slot_count'))).toContain(
       "THEN coverage.residential_count ELSE coverage.active_count END AS active_count"
     );

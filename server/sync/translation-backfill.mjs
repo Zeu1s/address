@@ -147,6 +147,7 @@ const COVERAGE_REFRESH_INTERVAL_MS = 10 * 60_000;
 const PUBLICATION_WINDOW_MS = 120_000;
 const CHINESE_FALLBACK_RETRY_MS = 6 * 60 * 60_000;
 const DEFERRED_STREET_BACKLOG = 200;
+const TERMINAL_FAILURE_REASONS = ['translation_or_publication_rejected', 'retry_limit', 'publication_timeout', 'publication_conflict'];
 const coverageRefreshedAt = new Map();
 const staleCoverage = new Set();
 export const refreshStaleCoverage = async (database, now, { force = false } = {}) => {
@@ -282,6 +283,8 @@ const runTranslationBatch = async ({ database, environment = process.env, fetchI
   const due = onlyCached ? [] : [
     ...await dueBranch(`status IN ('pending','waiting') AND (next_attempt_at IS NULL OR next_attempt_at<=?)`,
       [now().toISOString()], 'next_attempt_at,address_id'),
+    ...await dueBranch(`status='failed' AND reason NOT IN (${TERMINAL_FAILURE_REASONS.map(() => '?').join(',')})`,
+      TERMINAL_FAILURE_REASONS, 'address_id'),
     ...await dueBranch(`status IN ('failed','rejected') AND service_revision<>
         CASE WHEN status='rejected' AND reason='base_contract' THEN ?
           WHEN status='failed' AND reason='translation_or_publication_rejected' THEN ? ELSE ? END`,
@@ -362,20 +365,22 @@ const runTranslationBatch = async ({ database, environment = process.env, fetchI
       }
       const unchanged = previous?.input_hash === fingerprint(row)
         && previous?.service_revision === stateRevision(services.revision, previous?.status, previous?.reason);
+      // Earlier releases stored waits that ran out of attempts as terminal failures; they get one final attempt.
+      const transientFailure = previous?.status === 'failed' && !TERMINAL_FAILURE_REASONS.includes(previous.reason);
       const cacheOnly = onlyCached || unchanged && (previous.status === 'failed'
         && ['translation_or_publication_rejected', 'retry_limit'].includes(previous.reason)
         || previous.status === 'waiting' && previous.attempts >= 3
           && ['publication_busy', 'publication_deferred', 'cancelled', 'batch_timeout'].includes(previous.reason));
       if (unchanged && !onlyCached && (previous.status === 'rejected'
         || previous.status === 'complete' && storedAddressPoolV2RowIsFullyTranslated(row, now())
-        || previous.status === 'failed' && !cacheOnly
+        || previous.status === 'failed' && !cacheOnly && !transientFailure
         || previous.next_attempt_at && previous.next_attempt_at > now().toISOString())) continue;
       if (!storedAddressPoolV2RowCanRecoverTranslations(row, now())) {
         if (!onlyCached) await saveState(database, row, services.revision, 'rejected', 0, null, 'base_contract', now(),
           diagnoseStoredAddressPoolV2Row(row, { recovery: true, now: now() }).issues);
         continue;
       }
-      const attempts = cacheOnly ? Number(previous?.attempts || 0) : unchanged ? previous.attempts + 1 : 1;
+      const attempts = cacheOnly ? Number(previous?.attempts || 0) : transientFailure ? 3 : unchanged ? previous.attempts + 1 : 1;
       if (attempts > 3) {
         await saveState(database, row, services.revision, 'failed', 3, null, 'retry_limit', now());
         continue;
@@ -481,8 +486,12 @@ const runTranslationBatch = async ({ database, environment = process.env, fetchI
     const retryAt = new Date(now().getTime() + 60_000 * 2 ** Math.max(0, usedAttempts - 1)).toISOString();
     let nextAttemptAt = waiting?.retryAt || retryAt;
     if (spentAttempt && nextAttemptAt < retryAt) nextAttemptAt = retryAt;
-    const status = waiting && cacheOnly ? 'waiting' : usedAttempts >= 3 ? 'failed' : waiting ? 'waiting' : 'pending';
-    await saveState(database, row, services.revision, status, usedAttempts,
+    // A provider cooldown or quota is a wait, not a translation failure: the row retries after the reset with its
+    // final provider attempt still in reserve. Interrupted rows that spent every attempt resume from the cache.
+    const providerWait = Boolean(waiting && !waitingReason);
+    const storedAttempts = providerWait ? Math.min(usedAttempts, 2) : usedAttempts;
+    const status = waiting ? 'waiting' : storedAttempts >= 3 ? 'failed' : 'pending';
+    await saveState(database, row, services.revision, status, storedAttempts,
       status === 'failed' ? null : nextAttemptAt,
       publicationFailure || waiting?.reason || 'translation_or_publication_rejected', now(),
       [...translationDiagnostics(row, variants), ...diagnoseStoredAddressPoolV2Row(localizedRow(row, variants), { now: now() }).issues]);

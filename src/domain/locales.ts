@@ -1,4 +1,5 @@
 import { supportedLocales, type Locale } from './types';
+import countryNames from './country-names.json';
 
 export { supportedLocales };
 
@@ -64,7 +65,11 @@ export const safeReturnPath = (value: string | null, origin: string, fallback: s
 
 export const uiTextLocale = (locale: Locale): 'en' | 'zh-CN' => locale === 'zh-CN' || locale === 'zh-TW' ? 'zh-CN' : 'en';
 
+// A fixed table keeps names identical between the server render and every browser; Intl.DisplayNames differs by
+// engine (Node: "Hong Kong SAR China", browsers: "Hong Kong SAR"), which broke hydration.
 export const localizedCountryName = (countryCode: string, locale: Locale, fallback: string): string => {
+  const fixed = (countryNames as Partial<Record<Locale, Record<string, string>>>)[locale]?.[countryCode];
+  if (fixed) return fixed;
   try {
     return new Intl.DisplayNames([locale], { type: 'region' }).of(countryCode) || fallback;
   } catch {

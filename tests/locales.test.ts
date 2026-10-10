@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { countries } from '../src/domain/countries';
 import { englishMessages, messages } from '../src/domain/i18n';
 import {
-  isLocale, localeDefinitions, localeFromPath, matchLocale, pathForLocale, safeReturnPath, supportedLocales
+  isLocale, localeDefinitions, localeFromPath, localizedCountryName, matchLocale, pathForLocale, safeReturnPath, supportedLocales
 } from '../src/domain/locales';
 
 describe('localized URL routing', () => {
@@ -44,5 +45,19 @@ describe('localized URL routing', () => {
       expect(Object.keys(messages[locale]).sort(), locale).toEqual(keys);
       expect(Object.values(messages[locale]).every(Boolean), locale).toBe(true);
     }
+  });
+});
+
+describe('country names', () => {
+  it('render the same names on the server and in every browser engine', () => {
+    vi.stubGlobal('Intl', { ...Intl, DisplayNames: class { of() { return 'engine-specific'; } } });
+    try {
+      for (const locale of supportedLocales) for (const country of countries) {
+        const name = localizedCountryName(country.code, locale, 'fallback');
+        expect(name, `${locale} ${country.code}`).not.toMatch(/^(engine-specific|fallback)$|SAR|特別行政區|特别行政区|特別行政区|특별행정구/u);
+      }
+      expect(localizedCountryName('HK', 'en', '')).toBe('Hong Kong');
+      expect(localizedCountryName('KR', 'zh-CN', '')).toBe('韩国');
+    } finally { vi.unstubAllGlobals(); }
   });
 });

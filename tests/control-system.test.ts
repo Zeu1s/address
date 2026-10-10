@@ -528,6 +528,12 @@ describe('control database security', () => {
       return Response.json({ ok: true });
     }, 'https://address.example');
     expect(style.status).toBe(200);
+    const telemetry = await proxyAmapServiceRequest(store, new Request(
+      'https://address.example/_AMapService/v3/log/init?eventId=resource.load&s=rsv3'
+    ), async () => { throw new Error('telemetry must not reach AMap'); }, 'https://address.example');
+    expect(telemetry.status).toBe(200);
+    expect(telemetry.headers.get('content-type')).toContain('javascript');
+    expect(await telemetry.text()).toBe('');
     const vectorBytes = new Uint8Array([0, 255, 1, 2]);
     const vector = await proxyAmapServiceRequest(store, new Request(
       'https://address.example/_AMapService/v3/vectormap?key=browser-js-key&z=4', { headers: { Origin: 'https://address.example' } }

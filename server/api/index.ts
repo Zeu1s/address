@@ -112,7 +112,6 @@ class MemoryCache {
 const locationCache = new MemoryCache(2_000);
 const poolMetadataCache = new WeakMap<object, {
   expiresAt: number;
-  v1?: Map<string, number>;
   v2?: Map<string, AddressPoolV2Count>;
 }>();
 const countryGoalCache = new WeakMap<object, { expiresAt: number; promise: ReturnType<typeof evaluateCountryGoals> }>();
@@ -198,18 +197,6 @@ const withGenerationSlot = async (
   }
   try { return await task(); }
   finally { selected.release(); }
-};
-
-const addressPoolCounts = async (db: Database | undefined): Promise<Map<string, number>> => {
-  const counts = new Map<string, number>();
-  if (!db) return counts;
-  const cached = poolMetadataCache.get(db as object);
-  if (cached?.v1 && cached.expiresAt > Date.now()) return cached.v1;
-  const rows = await db.prepare('SELECT country_code, COUNT(*) AS total FROM address_pool WHERE active = 1 GROUP BY country_code')
-    .all<{ country_code: string; total: number }>();
-  for (const row of rows.results || []) counts.set(row.country_code, Number(row.total || 0));
-  poolMetadataCache.set(db as object, { ...poolMetadataCache.get(db as object), expiresAt: Date.now() + 30_000, v1: counts });
-  return counts;
 };
 
 interface AddressPoolV2Count { total: number; residential: number }
@@ -673,9 +660,15 @@ app.get('/api/v1/generate', async (context) => {
   let eligibleCount: number | undefined;
   const pooled = await measureStage(timings, 'pool', async () => {
     if (country.code === 'CN' && residential) {
+      // IP databases name places in English (Jiangsu Sheng, Nanjing) while communities store Chinese names, so IP
+      // lookups match by coordinates, or by the catalog's Chinese names when the IP carries no coordinates.
+      const chinaIpFilters: AddressFilters | undefined = ipCoordinates ? { q: filters.q }
+        : target?.cityNative || target?.city
+          ? { q: filters.q, region: target.regionNative || target.region, city: target.cityNative || target.city } : undefined;
+      if (ipRegionMode && !chinaIpFilters) return undefined;
       const community = await toleratePoolFailure(() => pickChinaCommunityAddress(
         context.env.ADDRESS_DB,
-        ipRegionMode ? ipLocationFilters : {
+        ipRegionMode ? chinaIpFilters! : {
           ...filters,
           region: target?.regionNative || filters.region
             || (filters.regionId || filters.cityId ? target?.region : undefined),
@@ -1042,16 +1035,16 @@ app.get('/api/v1/data-health', async (context) => {
       : [])
   ];
   const checkedAt = new Date().toISOString();
-  const [poolCounts, poolV2Counts, coverage] = await Promise.all([
-    addressPoolCounts(context.env.LOCATION_DB),
-    addressPoolV2Counts(context.env.ADDRESS_DB),
+  // Counting the whole pool takes about a minute on production, so health reads the published coverage snapshot.
+  const [poolV2Counts, coverage] = await Promise.all([
+    publishedCountryCounts(context.env.ADDRESS_DB),
     hotPoolCoverage(context.env.ADDRESS_DB, requiredCountries, minimumPerSlot)
   ]);
   const coverageByCountry = new Map(coverage.countries.map((item) => [item.country_code, item]));
   const missingCountries = requiredCountries.filter((code) => !coverageByCountry.get(code)?.slot_count);
   const perCountry = countries.map((country) => {
-    const v1 = poolCounts.get(country.code) || 0;
     const v2 = poolV2Counts.get(country.code);
+    const v1 = v2?.total || 0;
     const hotPool = coverageByCountry.get(country.code);
     const hotPoolSlots = Number(hotPool?.slot_count || 0);
     const readyHotPoolSlots = Number(hotPool?.ready_slot_count || 0);

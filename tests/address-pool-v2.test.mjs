@@ -647,4 +647,25 @@ describe('ADDRESS_DB v2 repository', () => {
     expect(selected?.address.id).toBe('pool-v2-near');
     expect(selected?.distanceKm).toBeLessThan(1);
   });
+
+  it('widens the IP search box only until it finds candidates', async () => {
+    const boxes = [];
+    const database = {
+      prepare(sql) {
+        const statement = {
+          bind(...values) { if (sql.includes('distance_score')) boxes.push(values.slice(-4)); return statement; },
+          async all() {
+            const [south, north] = boxes.at(-1);
+            return { results: north - south > 0.1 ? [{ ...row, id: 'suburb', latitude: 35.72, longitude: 139.642 }] : [] };
+          }
+        };
+        return statement;
+      }
+    };
+    const selected = await pickNearestAddressPoolV2Address(
+      database, 'JP', true, { latitude: 35.676, longitude: 139.642 }, 'widening', 25, new Date('2026-07-20T00:00:00Z')
+    );
+    expect(selected?.address.id).toBe('pool-v2-suburb');
+    expect(boxes.map(([south, north]) => Math.round((north - south) * 111.32 / 2))).toEqual([2, 8]);
+  });
 });

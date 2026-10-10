@@ -184,6 +184,11 @@ export const proxyAmapServiceRequest = async (
 ): Promise<Response> => {
   if (request.method !== 'GET') return proxyError(405, 'METHOD_NOT_ALLOWED');
   const requestUrl = new URL(request.url);
+  // The SDK loads its own telemetry (/v3/log/init) as keyless scripts, often without a referrer. Nothing is
+  // forwarded: an empty script ends the request locally.
+  if (requestUrl.pathname.startsWith(`${amapServicePrefix}/v3/log/`)) {
+    return new Response('', { headers: { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store' } });
+  }
   const origin = request.headers.get('origin');
   const referer = request.headers.get('referer');
   let allowed;
