@@ -118,6 +118,24 @@ describe('China community storage integration', () => {
     expect(empty.status).toBe(404);
   });
 
+  it('generates from a district alone instead of resolving an unrelated catalog city', async () => {
+    const service = new ChinaDataService(addressDb, control);
+    await processCandidate(service, { ...candidate('amap', 'district-only', '文化路18号'), postcode: '064000' });
+    await addressDb.exec(`INSERT INTO catalog_regions(id,country_code,code,name,native_name,zh_name,path) VALUES
+      (1000,'CN','HE','Hebei','河北省','河北省','CN/HE'),(1001,'CN','SC','Sichuan','四川省','四川省','CN/SC');
+      INSERT INTO catalog_cities(id,country_code,region_id,name,native_name,zh_name,population,latitude,longitude)
+      VALUES (1000,'CN',1001,'Chengdu','成都市','成都市',9000000,30.6,104.1);`);
+    const env = { ADDRESS_DB: addressDb, LOCATION_DB: addressDb };
+    const byName = await app.request(`/api/v1/generate?country=CN&district=${encodeURIComponent('丰润区')}`, {}, env);
+    expect(byName.status).toBe(200);
+    expect((await byName.json()).data.result.address.components).toMatchObject({ admin1: '河北省', locality: '唐山市', district: '丰润区' });
+    const [option] = (await queryLocationCatalog(addressDb, { country: 'CN', field: 'district', query: '丰润' })).options;
+    expect(option).toMatchObject({ value: '丰润区', parentValue: '唐山市', regionValue: '河北省', availableCount: 1 });
+    const byId = await app.request(`/api/v1/generate?country=CN&districtId=${option.id}`, {}, env);
+    expect(byId.status).toBe(200);
+    expect((await byId.json()).data.result.address.components.district).toBe('丰润区');
+  });
+
   it.each(['succeeded', 'paused_quota', 'failed'])('refreshes China coverage after a %s exit without a global pool scan', async (status) => {
     const service = new ChinaDataService(addressDb, control);
     await seedStaleCoverage(service);

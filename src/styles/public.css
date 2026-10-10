@@ -74,3 +74,6 @@ body::after { bottom: -24vh; left: 6vw; width: 48vw; max-width: 700px; backgroun
   .skeleton-line { animation: none; }
   .generate-button { transition: none; }
 }
+.combobox-popup button[aria-selected="true"] { font-weight: 600; }
+.combobox-option-context { margin-left: 6px; color: var(--ink-3); font-size: 11px; font-style: normal; }
+.combobox-popup button:hover .combobox-option-context, .combobox-popup button.active .combobox-option-context { color: var(--accent-strong); }

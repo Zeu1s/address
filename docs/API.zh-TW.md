@@ -150,7 +150,9 @@ curl -fsS "https://address.example.com/api/v1/locations/search?country=CN&field=
   -H "Authorization: Bearer YOUR_API_TOKEN"
 ```
 
-返回的 `id` 請原樣傳給 `/generate` 的 `*Id` 參數。郵遞區號選項可能沒有目錄 ID，此時把 `value` 作為 `postcode` 傳入即可。
+返回的 `id` 請原樣傳給 `/generate` 的 `*Id` 參數。郵遞區號選項可能沒有目錄 ID，此時把 `value` 作為 `postcode` 傳入即可。中國區縣選項同時返回所屬城市（`parentValue`、`parentId`）和省份（`regionValue`、`regionId`），因為區縣名會在不同城市重複；只傳 `districtId` 即可精確選中該區縣。
+
+選項列表來自每個國家的快照，快照在背景重建，因此數量可能比剛發布的地址晚幾分鐘。
 
 `GET /locations/hierarchy` 使用 `country`、`parentType`、`parentId`、`childType` 逐級瀏覽行政區。
 

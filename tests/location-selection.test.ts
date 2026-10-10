@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { filterLocationOptions } from '../src/components/App';
+import { exactLocationMatches, filterLocationOptions, sameLocationOption } from '../src/components/App';
 import { resolveCatalogTarget } from '../server/api/repositories/address-repository';
-import { CN_SYNTHETIC_CITY_PREFIX, decodeSyntheticCityId, decodeSyntheticDistrictId, queryLocationCatalog } from '../server/api/repositories/location-catalog';
+import { CN_SYNTHETIC_CITY_PREFIX, decodeSyntheticCityId, decodeSyntheticDistrict, decodeSyntheticDistrictId, queryLocationCatalog } from '../server/api/repositories/location-catalog';
 import { locationOptionLabel } from '../src/domain/location-options';
 
 type TargetDb = Parameters<typeof resolveCatalogTarget>[0];
@@ -9,10 +9,9 @@ type CatalogDb = Parameters<typeof queryLocationCatalog>[0];
 
 interface ChinaFixture {
   regions?: Array<{ id: number; code?: string; name: string; native_name: string; zh_name: string }>;
-  communities?: Array<{ province: string; city: string; address_count: number }>;
+  communities?: Array<{ province: string; city: string; district?: string; address_count: number }>;
   catalogCities?: Array<{ id: number; region_id: number | null; name: string; native_name: string; zh_name: string; population?: number | null }>;
   proxy?: { id: number; region_id: number | null; name: string; native_name: string; zh_name: string; population?: number | null };
-  districts?: Array<{ district: string; address_count: number }>;
   statements?: string[];
   bindings?: unknown[][];
 }
@@ -20,18 +19,23 @@ interface ChinaFixture {
 const chinaDb = (fixture: ChinaFixture): CatalogDb => ({
   prepare(sql: string) {
     fixture.statements?.push(sql);
+    let bound: unknown[] = [];
     const statement = {
-      bind(...values: unknown[]) { fixture.bindings?.push([sql, ...values]); return statement; },
+      bind(...values: unknown[]) { bound = values; fixture.bindings?.push([sql, ...values]); return statement; },
       async first<T>() {
         if (sql.includes('ORDER BY COALESCE(c.population, 0) DESC LIMIT 1')) return (fixture.proxy ?? null) as T;
-        if (sql.includes('COUNT(DISTINCT community.district)')) return { total: fixture.districts?.length || 0 } as T;
-        return { total: 0 } as T;
+        if (sql.includes('FROM catalog_cities WHERE id = ?')) {
+          const id = Number(bound[0]);
+          return (fixture.catalogCities?.find((city) => city.id === id) ?? null) as T;
+        }
+        return null as T;
       },
       async all<T>() {
         if (sql.includes('FROM catalog_regions') && sql.includes('parent_id IS NULL')) return { results: fixture.regions || [] } as T;
-        if (sql.includes('GROUP BY community.province, community.city')) return { results: fixture.communities || [] } as T;
+        if (sql.includes('GROUP BY community.province,community.city,community.district')) {
+          return { results: (fixture.communities || []).map((row) => ({ district: '', ...row })) } as T;
+        }
         if (sql.includes('FROM catalog_cities c WHERE c.country_code')) return { results: fixture.catalogCities || [] } as T;
-        if (sql.includes('GROUP BY community.district')) return { results: fixture.districts || [] } as T;
         return { results: [] } as T;
       }
     };
@@ -128,8 +132,10 @@ describe('stable location selection', () => {
           bind() { return statement; },
           async first<T>() { return { total: 1 } as T; },
           async all<T>() {
-            if (sql.includes('MIN(p.id) AS id')) return { results: [postcode] } as T;
-            if (sql.includes('COUNT(address.id) AS address_count')) return { results: [{ id: 1, address_count: 4 }] } as T;
+            if (sql.includes('FROM catalog_postcodes p')) return { results: [{ ...postcode, postcode_key: '1234ab' }] } as T;
+            if (sql.includes('GROUP BY postcode_key')) return { results: [{
+              postcode_key: '1234ab', admin1_key: 'north', admin1_code_key: 'no', locality_key: 'example', postal_locality_key: 'example', address_count: 4
+            }] } as T;
             return { results: [] } as T;
           }
         };
@@ -142,7 +148,7 @@ describe('stable location selection', () => {
     expect(result.options[0]).toMatchObject({ value: '1234 AB', availableCount: 4 });
     const indexQueries = statements.filter((sql) => sql.includes('address_generation_index'));
     expect(indexQueries).toHaveLength(2);
-    expect(indexQueries.join('\n')).toContain("available.postcode_key=LOWER(REPLACE(p.code,' ',''))");
+    expect(indexQueries.join('\n')).toContain("LOWER(REPLACE(p.code,' ','')) IN (");
     expect(statements.join('\n')).not.toContain('address_pool_evidence');
   });
 
@@ -328,41 +334,49 @@ describe('stable location selection', () => {
     expect(result.nextCursor).toBe('100');
   });
 
-  it('serves China district options from published communities with availability counts', async () => {
-    const rows = [
-      { district: '天河区', address_count: 12 },
-      { district: '越秀区', address_count: 3 }
-    ];
-    const statements: string[] = [];
-    let districtBindings: unknown[] = [];
-    const db = {
-      prepare(sql: string) {
-        statements.push(sql);
-        const statement = {
-          bind(...bindings: unknown[]) {
-            if (sql.includes('GROUP BY community.district')) districtBindings = bindings;
-            return statement;
-          },
-          async first<T>() { return { total: rows.length } as T; },
-          async all<T>() { return { results: sql.includes('GROUP BY community.district') ? rows : [] } as T; }
-        };
-        return statement;
-      }
-    } as unknown as CatalogDb;
+  it('serves China district options from published communities with their own city and province', async () => {
+    const db = chinaDb({
+      regions: [{ id: 20, code: 'GD', name: 'Guangdong', native_name: '广东省', zh_name: '广东省' }, beijingRegion],
+      communities: [
+        { province: '广东省', city: '广州市', district: '越秀区', address_count: 3 },
+        { province: '广东省', city: '广州市', district: '天河区', address_count: 12 },
+        { province: '北京市', city: '北京市', district: '朝阳区', address_count: 7 }
+      ],
+      catalogCities: [{ id: 201, region_id: 20, name: 'Guangzhou', native_name: '广州', zh_name: '广州' }]
+    });
 
     const result = await queryLocationCatalog(db, { country: 'CN', field: 'district', regionId: '20', cityId: '201', residential: true });
 
-    expect(statements.filter((sql) => !sql.includes('address_pool_revisions')).every((sql) => sql.includes('cn_communities_v2'))).toBe(true);
-    expect(statements[statements.length - 1]).toContain('catalog_cities WHERE id = ?');
-    expect(districtBindings).toContain(20);
-    expect(districtBindings).toContain(201);
     expect(result.total).toBe(2);
     expect(result.availableTotal).toBe(2);
     expect(result.options).toEqual([
-      expect.objectContaining({ id: expect.stringMatching(/^cn-district-/u), value: '天河区', label: '天河区', availableCount: 12, disabled: false }),
-      expect.objectContaining({ id: expect.stringMatching(/^cn-district-/u), value: '越秀区', label: '越秀区', availableCount: 3, disabled: false })
+      expect.objectContaining({ value: '天河区', label: '天河区', en: 'Tianhe District', availableCount: 12, disabled: false,
+        parentValue: '广州市', parentId: '201', parentLabel: '广州市 · 广东省', regionId: '20', regionValue: '广东省' }),
+      expect.objectContaining({ value: '越秀区', availableCount: 3 })
     ]);
+    expect(decodeSyntheticDistrict(result.options[0].id)).toEqual({ province: '广东省', city: '广州市', district: '天河区' });
     expect(decodeSyntheticDistrictId(result.options[0].id)).toBe('天河区');
+    const nationwide = await queryLocationCatalog(db, { country: 'CN', field: 'district', query: 'chaoyang' });
+    expect(nationwide.options).toEqual([expect.objectContaining({ value: '朝阳区', parentLabel: '北京市', regionValue: '北京市' })]);
+  });
+
+  it('keeps districts that share a name in different cities apart', async () => {
+    const db = chinaDb({
+      regions: [beijingRegion, { id: 2271, code: 'JL', name: 'Jilin', native_name: '吉林省', zh_name: '吉林省' }],
+      communities: [
+        { province: '北京市', city: '北京市', district: '朝阳区', address_count: 120 },
+        { province: '吉林省', city: '长春市', district: '朝阳区', address_count: 9 }
+      ]
+    });
+    const result = await queryLocationCatalog(db, { country: 'CN', field: 'district', query: '朝阳' });
+    expect(result.options.map((option) => [option.availableCount, option.parentValue])).toEqual([[120, '北京市'], [9, '长春市']]);
+    expect(new Set(result.options.map((option) => option.id)).size).toBe(2);
+  });
+
+  it('still decodes district ids that carry only the district name', () => {
+    const legacy = `cn-district-${Buffer.from('丰润区', 'utf8').toString('hex')}`;
+    expect(decodeSyntheticDistrict(legacy)).toEqual({ district: '丰润区' });
+    expect(decodeSyntheticDistrict('cn-district-zz')).toBeUndefined();
   });
 
   it('returns an empty district page for countries without a district catalog', async () => {
@@ -414,57 +428,36 @@ describe('stable location selection', () => {
 
 describe('China community-backed selection', () => {
   it('serves the Beijing municipality cascade: region value, one city with count, districts', async () => {
-    const regionFixture: ChinaFixture = { statements: [] };
-    const regionDb = {
-      prepare(sql: string) {
-        regionFixture.statements?.push(sql);
-        const statement = {
-          bind() { return statement; },
-          async first<T>() { return { total: 1 } as T; },
-          async all<T>() {
-            if (sql.includes('FROM catalog_regions')) {
-              return { results: [{ id: 2257, parent_id: null, code: 'BJ', name: 'Beijing', native_name: '北京市', zh_name: '北京市' }] } as T;
-            }
-            if (sql.includes('cn_communities_v2')) return { results: [{ province: '北京市', address_count: 341 }] } as T;
-            return { results: [] } as T;
-          }
-        };
-        return statement;
-      }
-    } as unknown as CatalogDb;
-    const regions = await queryLocationCatalog(regionDb, { country: 'CN', field: 'region', residential: true });
-    expect(regions.options[0]).toMatchObject({ value: '北京市', label: '北京市', en: 'Beijing', availableCount: 341, disabled: false, id: '2257' });
-    expect(regionFixture.statements?.filter((sql) => sql.includes('cn_communities_v2'))).toHaveLength(1);
-    await expect(queryLocationCatalog(regionDb, { country: 'CN', field: 'region', residential: true })).resolves.toEqual(regions);
-    expect(regionFixture.statements?.filter((sql) => !sql.includes('address_pool_revisions'))).toHaveLength(2);
-
-    const cityDb = chinaDb({
+    const fixture: ChinaFixture = {
       regions: [beijingRegion],
-      communities: [{ province: '北京市', city: '北京市', address_count: 341 }],
-      catalogCities: [{ id: 19332, region_id: 2257, name: 'Beijing', native_name: '北京', zh_name: '北京', population: 21893095 }]
-    });
-    const cities = await queryLocationCatalog(cityDb, { country: 'CN', field: 'city', regionId: '2257', residential: true });
+      communities: [
+        { province: '北京市', city: '北京市', district: '朝阳区', address_count: 120 },
+        { province: '北京市', city: '北京市', district: '海淀区', address_count: 80 },
+        { province: '北京市', city: '北京市', address_count: 141 }
+      ],
+      catalogCities: [{ id: 19332, region_id: 2257, name: 'Beijing', native_name: '北京', zh_name: '北京', population: 21893095 }],
+      statements: []
+    };
+    const db = chinaDb(fixture);
+    const regions = await queryLocationCatalog(db, { country: 'CN', field: 'region', residential: true });
+    expect(regions.options[0]).toMatchObject({ value: '北京市', label: '北京市', en: 'Beijing', availableCount: 341, disabled: false, id: '2257' });
+    await expect(queryLocationCatalog(db, { country: 'CN', field: 'region', residential: true })).resolves.toEqual(regions);
+
+    const cities = await queryLocationCatalog(db, { country: 'CN', field: 'city', regionId: '2257', residential: true });
     expect(cities.total).toBe(1);
     expect(cities.options).toEqual([expect.objectContaining({
       value: '北京市', label: '北京市', availableCount: 341, disabled: false,
       id: '19332', parentId: '2257', regionId: '2257', regionValue: '北京市'
     })]);
 
-    const districtFixture: ChinaFixture = {
-      districts: [{ district: '朝阳区', address_count: 120 }, { district: '海淀区', address_count: 80 }],
-      statements: [], bindings: []
-    };
-    const districts = await queryLocationCatalog(chinaDb(districtFixture), {
-      country: 'CN', field: 'district', regionId: '2257', cityId: '19332', residential: true
-    });
+    // Suffix tolerance keeps catalog 北京 matched to community 北京市.
+    const districts = await queryLocationCatalog(db, { country: 'CN', field: 'district', regionId: '2257', cityId: '19332', residential: true });
     expect(districts.options).toEqual([
-      expect.objectContaining({ value: '朝阳区', availableCount: 120 }),
+      expect.objectContaining({ value: '朝阳区', availableCount: 120, parentId: '19332' }),
       expect.objectContaining({ value: '海淀区', availableCount: 80 })
     ]);
-    const districtSql = districtFixture.statements?.find((sql) => sql.includes('GROUP BY community.district')) || '';
-    // Suffix tolerance keeps catalog 北京 matched to community 北京市.
-    expect(districtSql).toContain(`REPLACE(community.city,'市','')`);
-    expect(districtSql).toContain('community.city = community.province');
+    // One grouping serves every field and repeat request.
+    expect(fixture.statements?.filter((sql) => sql.includes('cn_communities_v2'))).toHaveLength(1);
   });
 
   it('dedupes the Tangshan double entry and prefers the exact catalog row', async () => {
@@ -516,14 +509,14 @@ describe('China community-backed selection', () => {
     expect(option.id?.startsWith(CN_SYNTHETIC_CITY_PREFIX)).toBe(true);
     expect(decodeSyntheticCityId(option.id)).toBe('黔南布依族苗族自治州');
 
-    const districtFixture: ChinaFixture = {
-      districts: [{ district: '都匀市', address_count: 30 }], statements: [], bindings: []
-    };
-    await queryLocationCatalog(chinaDb(districtFixture), {
-      country: 'CN', field: 'district', regionId: '2261', cityId: option.id, residential: true
-    });
-    const bound = districtFixture.bindings?.find(([sql]) => String(sql).includes('GROUP BY community.district')) || [];
-    expect(bound).toContain('黔南布依族苗族自治州');
+    const districts = await queryLocationCatalog(chinaDb({
+      regions: [{ id: 2261, code: 'GZ', name: 'Guizhou', native_name: '贵州省', zh_name: '贵州省' }],
+      communities: [
+        { province: '贵州省', city: '黔南布依族苗族自治州', district: '都匀市', address_count: 30 },
+        { province: '贵州省', city: '贵阳市', district: '南明区', address_count: 5 }
+      ]
+    }), { country: 'CN', field: 'district', regionId: '2261', cityId: option.id, residential: true });
+    expect(districts.options.map(({ value }) => value)).toEqual(['都匀市']);
   });
 
   it('matches suffix-tolerant queries and English catalog names when searching cities', async () => {
@@ -578,5 +571,26 @@ describe('client-side city filtering', () => {
   it('renders English first and the localized name second in other interfaces', () => {
     expect(locationOptionLabel(options[0], 'zh-CN')).toBe('Xiamen · 厦门市');
     expect(locationOptionLabel(options[2], 'de')).toBe('Munich · München');
+  });
+});
+
+describe('combobox selection helpers', () => {
+  const tianhe = { id: 'a', value: '天河区', label: '天河区', en: 'Tianhe District', zhCN: '天河区' };
+  const chaoyangBeijing = { id: 'b', value: '朝阳区', label: '朝阳区', en: 'Chaoyang District', zhCN: '朝阳区' };
+  const chaoyangChangchun = { id: 'c', value: '朝阳区', label: '朝阳区', en: 'Chaoyang District', zhCN: '朝阳区' };
+
+  it('tells same-named options apart by id', () => {
+    expect(sameLocationOption(chaoyangBeijing, chaoyangBeijing)).toBe(true);
+    expect(sameLocationOption(chaoyangBeijing, chaoyangChangchun)).toBe(false);
+    expect(sameLocationOption({ value: '朝阳区', label: '朝阳区' }, chaoyangChangchun)).toBe(true);
+    expect(sameLocationOption(undefined, tianhe)).toBe(false);
+  });
+
+  it('accepts only a single exact name match when the field is left', () => {
+    expect(exactLocationMatches([tianhe, chaoyangBeijing], ' 天河区 ', 'zh-CN')).toEqual([tianhe]);
+    expect(exactLocationMatches([tianhe], 'tianhe district', 'en')).toEqual([tianhe]);
+    expect(exactLocationMatches([tianhe], '天河', 'zh-CN')).toEqual([]);
+    expect(exactLocationMatches([chaoyangBeijing, chaoyangChangchun], '朝阳区', 'zh-CN')).toHaveLength(2);
+    expect(exactLocationMatches([tianhe], '', 'zh-CN')).toEqual([]);
   });
 });

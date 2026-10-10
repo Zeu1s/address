@@ -249,6 +249,13 @@ export const filterLocationOptions = (options: LocationOption[], query: string):
     .some((value) => value && locationSearchForms(value)
       .some((candidate) => searches.some((search) => candidate.includes(search)))));
 };
+export const sameLocationOption = (left: LocationOption | undefined, right: LocationOption): boolean =>
+  Boolean(left) && left!.value === right.value && (!left!.id || !right.id || left!.id === right.id);
+export const exactLocationMatches = (options: LocationOption[], query: string, locale: Locale): LocationOption[] => {
+  const typed = normalizeLocationSearch(query);
+  return typed ? options.filter((option) => [option.value, option.label, option.native, option.en, option.zhCN, locationOptionLabel(option, locale)]
+    .some((name) => name && normalizeLocationSearch(name) === typed)) : [];
+};
 type GenerationErrorMessageKey = 'retry' | 'noPoolCoverage' | 'ipNoResult' | 'ipLookupFailed' | 'requestFailed';
 export const generationErrorMessageKey = (code: string, ipRegion: boolean): GenerationErrorMessageKey => {
   if (code === 'NO_POOL_COVERAGE') return 'noPoolCoverage';
@@ -1135,9 +1142,12 @@ export default function App({ locale, apiBaseUrl }: AppProps) {
                 if (filterFields.includes('district')) void loadOptions('district', '', { region: option.regionValue || region, regionId: option.regionId || regionId, city: value, cityId: option.id || '' });
                 if (filterFields.includes('postcode')) void loadOptions('postcode', '', { region: option.regionValue || region, regionId: option.regionId || regionId, city: value, cityId: option.id || '' });
               }}/>}
-              {filterFields.includes('district') && <Combobox locale={locale} label={(selectedCountry.searchLabels.district || selectedCountry.searchLabels.city)[textLocale]} value={district} options={locations.districts} placeholder={t.allCities} unavailableLabel={t.noAddressOption} loadingLabel={t.loading} errorLabel={locationErrors.district} state={locationLoadState.district} total={locationMeta.district.total} hasMore={Boolean(locationMeta.district.nextCursor)} onOpen={() => void loadOptions('district')} onRetry={() => void loadOptions('district', locationQueries.current.district, locationRetries.current.district)} onLoadMore={() => loadOptions('district', locationQueries.current.district, { cursor: locationMeta.district.nextCursor, append: true })} onSearch={(query) => loadOptions('district', query)} onChange={(value) => {
+              {filterFields.includes('district') && <Combobox locale={locale} label={(selectedCountry.searchLabels.district || selectedCountry.searchLabels.city)[textLocale]} value={district} options={locations.districts} placeholder={t.allCities} unavailableLabel={t.noAddressOption} loadingLabel={t.loading} errorLabel={locationErrors.district} state={locationLoadState.district} total={locationMeta.district.total} hasMore={Boolean(locationMeta.district.nextCursor)} onOpen={() => void loadOptions('district')} onRetry={() => void loadOptions('district', locationQueries.current.district, locationRetries.current.district)} onLoadMore={() => loadOptions('district', locationQueries.current.district, { cursor: locationMeta.district.nextCursor, append: true })} onSearch={(query) => loadOptions('district', query)} showContext={!city} onChange={(value, option) => {
                 cancelGeneration();
                 setDistrict(value);
+                // District names repeat across cities, so a district fixes its own city and province.
+                if (value && option.parentValue) { setCity(option.parentValue); setCityId(option.parentId || ''); }
+                if (value && option.regionValue) { setRegion(option.regionValue); setRegionId(option.regionId || ''); }
               }}/>}
               {filterFields.includes('postcode') && <Combobox locale={locale} label={selectedCountry.searchLabels.postcode[textLocale]} value={postcode} options={locations.postcodes} placeholder={t.allPostcodes} unavailableLabel={t.noAddressOption} loadingLabel={t.loading} errorLabel={locationErrors.postcode} state={locationLoadState.postcode} total={locationMeta.postcode.total} hasMore={Boolean(locationMeta.postcode.nextCursor)} onOpen={() => void loadOptions('postcode')} onRetry={() => void loadOptions('postcode', locationQueries.current.postcode, locationRetries.current.postcode)} onLoadMore={() => loadOptions('postcode', locationQueries.current.postcode, { cursor: locationMeta.postcode.nextCursor, append: true })} onSearch={(query) => loadOptions('postcode', query)} onChange={(value, option) => {
                 cancelGeneration();
@@ -1250,107 +1260,114 @@ const optionPageText: Record<Locale, [string, string, string]> = {
   es: ['Página anterior', 'Página siguiente', 'Cargar más'], pt: ['Página anterior', 'Próxima página', 'Carregar mais']
 };
 
-function Combobox({ locale, label, value, options, placeholder, unavailableLabel, loadingLabel, errorLabel, state, total, hasMore = false, clientFilter = false, onOpen, onRetry, onLoadMore, onChange, onSearch }: {
+function Combobox({ locale, label, value, options, placeholder, unavailableLabel, loadingLabel, errorLabel, state, total, hasMore = false, clientFilter = false, showContext = false, onOpen, onRetry, onLoadMore, onChange, onSearch }: {
   locale: Locale; label: string; value: string; options: LocationOption[]; placeholder: string; unavailableLabel: string;
-  loadingLabel: string; errorLabel?: string; state: LocationLoadState; total: number; hasMore?: boolean; clientFilter?: boolean;
+  loadingLabel: string; errorLabel?: string; state: LocationLoadState; total: number; hasMore?: boolean; clientFilter?: boolean; showContext?: boolean;
   onOpen?: () => void | Promise<void>; onRetry?: () => void | Promise<void>; onLoadMore?: () => void | Promise<void>;
   onChange: (value: string, option: LocationOption) => void; onSearch?: (query: string) => void | Promise<void>;
 }) {
   const id = useId();
   const root = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState(value);
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [query, setQuery] = useState('');
+  // The input shows the active filter until the user types; only typed text searches.
+  const [typing, setTyping] = useState(false);
+  // -1 follows the query: the first match while searching, otherwise the selected option.
+  const [activeIndex, setActiveIndex] = useState(-1);
   const [renderCount, setRenderCount] = useState(LOCATION_OPTION_RENDER_STEP);
+  // The chosen option outlives the loaded page, so reopening still shows and marks it.
+  const [chosen, setChosen] = useState<LocationOption | undefined>();
   const searchedQuery = useRef('');
-  const skipValueSync = useRef(false);
   const onSearchRef = useRef(onSearch);
   const onOpenRef = useRef(onOpen);
-  const selected = options.find((option) => option.value === value);
-  const selectedLabel = selected ? locationOptionLabel(selected, locale) : value;
+  const selected = value ? options.find((option) => option.value === value && (!chosen?.id || !option.id || option.id === chosen.id))
+    || (chosen?.value === value ? chosen : { value, label: value }) : undefined;
+  const selectedLabel = selected ? locationOptionLabel(selected, locale) : '';
   const text = optionPageText[locale];
   useEffect(() => { onSearchRef.current = onSearch; }, [onSearch]);
   useEffect(() => { onOpenRef.current = onOpen; }, [onOpen]);
-  useEffect(() => {
-    if (skipValueSync.current) { skipValueSync.current = false; return; }
-    setQuery(selectedLabel);
-  }, [value, selectedLabel]);
+  useEffect(() => { if (chosen && chosen.value !== value) setChosen(undefined); }, [value]);
+  const searchQuery = typing ? query : '';
   // Loaded options are filtered instantly; the server is asked only when the loaded list is incomplete.
   const complete = !hasMore && total <= options.length;
   useEffect(() => {
     if (!open || clientFilter || !onSearchRef.current) return;
-    const searchQuery = selectedLabel === query ? '' : query;
     if (searchedQuery.current === searchQuery || (complete && searchedQuery.current === '')) return;
     const timer = window.setTimeout(() => { searchedQuery.current = searchQuery; void onSearchRef.current?.(searchQuery); }, 150);
     return () => window.clearTimeout(timer);
-  }, [query, open, selectedLabel, clientFilter, complete]);
-  useEffect(() => { setActiveIndex(0); setRenderCount(LOCATION_OPTION_RENDER_STEP); }, [query, clientFilter]);
-  useEffect(() => {
-    if (!open) return;
-    const close = (event: PointerEvent) => {
-      if (!root.current?.contains(event.target as Node)) { setOpen(false); setQuery(selectedLabel); }
-    };
-    document.addEventListener('pointerdown', close);
-    return () => document.removeEventListener('pointerdown', close);
-  }, [open, selectedLabel]);
-  const searchQuery = selectedLabel === query ? '' : query;
+  }, [searchQuery, open, clientFilter, complete]);
+  useEffect(() => { setActiveIndex(-1); setRenderCount(LOCATION_OPTION_RENDER_STEP); }, [searchQuery, clientFilter]);
   const visibleOptions = filterLocationOptions(options, searchQuery)
     .filter((option) => !option.disabled && option.availableCount !== 0);
-  const renderedOptions = visibleOptions.slice(0, renderCount)
+  const pinned = selected && !searchQuery && !visibleOptions.some((option) => sameLocationOption(selected, option)) ? [selected] : [];
+  const renderedOptions = [...pinned, ...visibleOptions.slice(0, renderCount)]
     .map((option) => ({ ...option, label: locationOptionLabel(option, locale) }));
   const values: LocationOption[] = [{ value: '', label: placeholder }, ...renderedOptions];
+  const selectedIndex = selected ? values.findIndex((option, index) => index > 0 && sameLocationOption(selected, option)) : 0;
+  const currentIndex = activeIndex >= 0 ? Math.min(activeIndex, values.length - 1)
+    : searchQuery ? (values.length > 1 ? 1 : 0) : Math.max(0, selectedIndex);
   useEffect(() => {
-    if (open) document.getElementById(`${id}-option-${Math.min(activeIndex, values.length - 1)}`)?.scrollIntoView({ block: 'nearest' });
-  }, [id, activeIndex, open, values.length]);
+    if (open) document.getElementById(`${id}-option-${currentIndex}`)?.scrollIntoView({ block: 'nearest' });
+  }, [id, currentIndex, open]);
   const showMore = () => {
     if (renderCount < visibleOptions.length) setRenderCount((count) => count + LOCATION_OPTION_RENDER_STEP);
     else if (hasMore && state !== 'loading') void onLoadMore?.();
   };
   const openMenu = () => {
-    if (!open) { searchedQuery.current = ''; void onOpenRef.current?.(); setRenderCount(LOCATION_OPTION_RENDER_STEP); setActiveIndex(0); }
+    if (!open) { searchedQuery.current = ''; void onOpenRef.current?.(); setRenderCount(LOCATION_OPTION_RENDER_STEP); setActiveIndex(-1); }
     setOpen(true);
   };
   const select = (option: LocationOption) => {
-    setQuery(option.value ? option.label : ''); onChange(option.value, option); setOpen(false); setActiveIndex(0);
+    setChosen(option.value ? option : undefined); setTyping(false); setQuery('');
+    onChange(option.value, option); setOpen(false); setActiveIndex(-1);
   };
+  // Leaving the field keeps it truthful: a single exact name match is chosen, anything else reverts to the active filter.
+  const leave = () => {
+    const exact = exactLocationMatches(visibleOptions, searchQuery, locale);
+    setOpen(false);
+    if (exact.length === 1) select(exact[0]);
+    else setTyping(false);
+  };
+  const leaveRef = useRef(leave);
+  leaveRef.current = leave;
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) leaveRef.current(); };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [open]);
   const keyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
       if (!open) { openMenu(); return; }
-      setActiveIndex((index) => {
-        const next = Math.max(0, Math.min(index + (event.key === 'ArrowDown' ? 1 : -1), values.length - 1));
-        if (next >= values.length - 3) showMore();
-        return next;
-      });
+      const next = Math.max(0, Math.min(currentIndex + (event.key === 'ArrowDown' ? 1 : -1), values.length - 1));
+      if (next >= values.length - 3) showMore();
+      setActiveIndex(next);
     }
     if ((event.key === 'PageDown' || event.key === 'PageUp') && open) {
       event.preventDefault();
-      setActiveIndex((index) => Math.max(0, Math.min(index + (event.key === 'PageDown' ? 10 : -10), values.length - 1)));
+      setActiveIndex(Math.max(0, Math.min(currentIndex + (event.key === 'PageDown' ? 10 : -10), values.length - 1)));
     }
-    if (event.key === 'Enter' && open) { event.preventDefault(); select(values[activeIndex] || values[0]); }
-    if (event.key === 'Escape') { event.preventDefault(); setOpen(false); setQuery(selectedLabel); }
+    if (event.key === 'Enter' && open) { event.preventDefault(); select(values[currentIndex] || values[0]); }
+    if (event.key === 'Escape') { event.preventDefault(); setOpen(false); setTyping(false); }
   };
   return <div className="filter custom-combobox" ref={root} onBlur={(event) => {
-    if (!event.currentTarget.contains(event.relatedTarget)) { setOpen(false); setQuery(selectedLabel); }
+    if (!event.currentTarget.contains(event.relatedTarget)) leave();
   }}>
     <label htmlFor={id}>{label}</label>
     <div className={`combobox-control ${open ? 'open' : ''}`}>
-      <input id={id} role="combobox" aria-expanded={open} aria-controls={`${id}-list`} aria-activedescendant={open ? `${id}-option-${Math.min(activeIndex, values.length - 1)}` : undefined} aria-autocomplete="list" aria-busy={state === 'loading'} value={query} placeholder={placeholder} onFocus={openMenu} onChange={(event) => {
-        const nextQuery = event.target.value;
-        if (value && nextQuery !== selectedLabel) {
-          skipValueSync.current = true; onChange('', { value: '', label: placeholder });
-        }
-        setQuery(nextQuery); setOpen(true); setActiveIndex(0);
+      <input id={id} role="combobox" aria-expanded={open} aria-controls={`${id}-list`} aria-activedescendant={open ? `${id}-option-${currentIndex}` : undefined} aria-autocomplete="list" aria-busy={state === 'loading'} value={typing ? query : selectedLabel} placeholder={placeholder} onFocus={openMenu} onChange={(event) => {
+        setQuery(event.target.value); setTyping(true); setOpen(true);
       }} onKeyDown={keyDown}/>
       {value && <button type="button" className="combobox-clear" aria-label={`${label}: ${placeholder}`} title={placeholder} onMouseDown={(event) => event.preventDefault()} onClick={() => select(values[0])}><X size={14} aria-hidden="true" /></button>}
-      <button type="button" aria-label={label} aria-expanded={open} onMouseDown={(event) => event.preventDefault()} onClick={() => open ? setOpen(false) : openMenu()}><ChevronDown size={16} aria-hidden="true" /></button>
+      <button type="button" aria-label={label} aria-expanded={open} onMouseDown={(event) => event.preventDefault()} onClick={() => open ? leave() : openMenu()}><ChevronDown size={16} aria-hidden="true" /></button>
     </div>
     {open && <div className="combobox-popup">
       <div className="combobox-options" id={`${id}-list`} role="listbox" aria-label={label} onScroll={(event) => {
         const list = event.currentTarget;
         if (list.scrollTop + list.clientHeight >= list.scrollHeight - 48) showMore();
       }}>
-        {values.map((option, index) => <button id={`${id}-option-${index}`} type="button" role="option" tabIndex={-1} aria-selected={!option.value ? !value : option.value === value} className={index === activeIndex ? 'active' : ''} key={option.id || option.value} onMouseDown={(event) => event.preventDefault()} onClick={() => select(option)}><span>{index ? highlightMatch(option.label, searchQuery) : option.label}</span>{option.availableCount !== undefined && <small>{new Intl.NumberFormat(locale).format(option.availableCount)}</small>}</button>)}
+        {values.map((option, index) => <button id={`${id}-option-${index}`} type="button" role="option" tabIndex={-1} aria-selected={index ? sameLocationOption(selected, option) : !value} className={index === currentIndex ? 'active' : ''} key={`${option.id || ''}:${option.value}`} onMouseDown={(event) => event.preventDefault()} onClick={() => select(option)}><span>{index ? highlightMatch(option.label, searchQuery) : option.label}{index > 0 && showContext && option.parentLabel && <em className="combobox-option-context">{option.parentLabel}</em>}</span>{option.availableCount !== undefined && <small>{new Intl.NumberFormat(locale).format(option.availableCount)}</small>}</button>)}
       </div>
       <div className="combobox-status" role="status" aria-live="polite">
         {state === 'loading' ? <span>{loadingLabel}</span>

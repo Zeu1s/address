@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openTestDatabase, type PostgresDatabase } from './helpers/postgres-test-database.mjs';
-import { queryLocationCatalog } from '../server/api/repositories/location-catalog';
+import { invalidateLocationCatalogCache, queryLocationCatalog } from '../server/api/repositories/location-catalog';
 import { resolveCatalogTarget } from '../server/api/repositories/address-repository';
 import app from '../server/api/index';
 import type { CountryCode } from '../src/domain/types';
@@ -113,6 +113,7 @@ describe('generation-backed location filters', () => {
     expect((await queryLocationCatalog(db, { ...input, residential: true })).total).toBe(12);
     await db.exec(`UPDATE address_generation_index SET active=0 WHERE country_code='SA';
       INSERT INTO address_pool_revisions(kind,version) VALUES ('generation:SA','retired-full-codes');`);
+    invalidateLocationCatalogCache(db);
     expect((await queryLocationCatalog(db, input)).options).toEqual([]);
     expect(await resolveCatalogTarget(db, 'SA', { postcode: '11000' }, 'retired-code')).toBeUndefined();
   });
@@ -165,12 +166,25 @@ describe('generation-backed location filters', () => {
       .toMatchObject({ postcode: '12345', cityId: 2, city: 'River Town' });
   });
 
-  it('invalidates cached options when the publication revision changes', async () => {
-    const input = { country: 'US' as const, field: 'postcode' as const };
-    expect((await queryLocationCatalog(db, input)).options).toHaveLength(2);
-    await db.exec(`UPDATE address_generation_index SET active=0;
-      INSERT INTO address_pool_revisions(kind,version) VALUES ('generation:US','after-retirement');`);
-    expect((await queryLocationCatalog(db, input)).options).toEqual([]);
+  it('keeps serving the previous snapshot until a publication change is rebuilt in the background', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const input = { country: 'US' as const, field: 'postcode' as const };
+      expect((await queryLocationCatalog(db, input)).options).toHaveLength(2);
+      await db.exec(`UPDATE address_generation_index SET active=0;
+        INSERT INTO address_pool_revisions(kind,version) VALUES ('generation:US','after-retirement');`);
+      expect((await queryLocationCatalog(db, input)).options).toHaveLength(2);
+      vi.setSystemTime(Date.now() + 3 * 60_000);
+      const stale = await queryLocationCatalog(db, input);
+      expect(stale.options).toHaveLength(2);
+      await vi.waitFor(async () => {
+        const fresh = await queryLocationCatalog(db, input);
+        expect(fresh.options).toEqual([]);
+        expect(fresh.revision).toBe('after-retirement');
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each(['US/CA', 'US/CA/'])('keeps descendant regions in scope without matching sibling prefixes: %s', async (path) => {

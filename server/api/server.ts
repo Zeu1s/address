@@ -17,6 +17,8 @@ import { InFlightLimiter, isGenerationPath } from './in-flight-limiter';
 import { parseAllowedOrigins } from '../lib/origin-policy';
 import { TranslationRouteScheduler } from '../translation/routing.mjs';
 import { translateGoogleBatch } from './services/google-translator.ts';
+import { prewarmLocationCatalog } from './repositories/location-catalog';
+import { countries } from '../../src/domain/countries';
 
 const integer = (value: string | undefined, fallback: number): number => {
   const parsed = Number.parseInt(value || String(fallback), 10);
@@ -261,6 +263,9 @@ const server = serve({
   port
 }, ({ address, port: listeningPort }) => {
   console.log(`Address service listening on http://${address}:${listeningPort}`);
+  void prewarmLocationCatalog(database, countries.map((country) => ({
+    country: country.code, postcode: country.addressSchema.filters.includes('postcode')
+  })));
 });
 
 void china.wake(0).catch((error) => console.error('[china-sync] automatic scheduling failed', error));

@@ -2,8 +2,9 @@ import { pinyin } from 'pinyin-pro';
 import type { CountryCode, LocationOption } from '../../../src/domain/types';
 import type { Database } from '../../database/database.mjs';
 import { chinaCommunityPublicationClause } from './china-community';
-import { catalogDescendantClause, catalogId, cityAliases, findRegion, loadCatalogRegions, regionAliasResolver, resolveCatalogTarget } from './address-repository';
-import { aliasClauseValues, poolLocationAliases } from './address-pool-v2';
+import { chinaEnglishComponent } from '../../../src/domain/china-address-language';
+import { catalogId, cityAliases, findRegion, loadCatalogRegions, regionAliasResolver, resolveCatalogTarget } from './address-repository';
+import { poolLocationAliases } from './address-pool-v2';
 
 export type CatalogField = 'region' | 'city' | 'district' | 'postcode';
 
@@ -68,7 +69,6 @@ interface PostcodeRow {
   region_code: string | null;
 }
 
-interface ChinaProvinceAvailabilityRow { province: string; address_count: number }
 interface GenerationLocationGroup {
   admin1_key: string; admin1_code_key: string; locality_key: string; postal_locality_key: string; address_count: number;
 }
@@ -79,15 +79,12 @@ const normalizeLimit = (value = PAGE_SIZE, maximum = 200): number => {
   return Math.max(20, Math.min(maximum, parsed));
 };
 const normalizeOffset = (cursor?: string): number => Math.max(0, Number.parseInt(cursor || '0', 10) || 0);
-const searchPattern = (query?: string): string => `%${(query || '').trim().toLocaleLowerCase().replace(/[\\%_]/g, '\\$&')}%`;
-const page = <T,>(rows: T[], total: number, offset: number): { rows: T[]; nextCursor?: string } => ({
-  rows, nextCursor: offset + rows.length < total ? String(offset + rows.length) : undefined
-});
-const generationLocations = async (db: Database, input: CatalogQuery): Promise<GenerationLocationGroup[]> =>
+const lowerKey = (value: string | null | undefined): string => (value || '').trim().toLocaleLowerCase();
+const generationLocations = async (db: Database, country: CountryCode, residential: boolean): Promise<GenerationLocationGroup[]> =>
   (await db.prepare(`SELECT admin1_key,admin1_code_key,locality_key,postal_locality_key,COUNT(*) AS address_count
-    FROM address_generation_index WHERE country_code=? AND active=1${input.residential ? ' AND residential_ready=1' : ''}
+    FROM address_generation_index WHERE country_code=? AND active=1${residential ? ' AND residential_ready=1' : ''}
     GROUP BY admin1_key,admin1_code_key,locality_key,postal_locality_key`)
-    .bind(input.country).all<GenerationLocationGroup>()).results;
+    .bind(country).all<GenerationLocationGroup>()).results;
 const regionMatches = (group: GenerationLocationGroup, names: string[]): boolean =>
   !names.length || names.includes(group.admin1_key) || names.includes(group.admin1_code_key);
 const selectedRegion = async (db: Database, input: CatalogQuery): Promise<number | undefined> => {
@@ -106,149 +103,166 @@ const cityLabel = (row: CityRow, country: CountryCode): string => {
   if (['CN', 'HK', 'TW'].includes(country)) return row.native_name || row.zh_name || row.name;
   const seen = new Set<string>();
   return [row.native_name, row.name, row.zh_name].filter((value) => {
-    const key = value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase().trim();
+    const key = value.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLocaleLowerCase().trim();
     if (!key || seen.has(key)) return false;
     seen.add(key);
     return true;
   }).join(' · ');
 };
 
-const queryRegions = async (db: Database, input: CatalogQuery, limit: number, offset: number): Promise<CatalogPage> => {
-  if (input.country === 'CN') {
-    const [regionResult, availabilityResult] = await Promise.all([
-      db.prepare(`SELECT id,parent_id,code,name,native_name,zh_name FROM catalog_regions
-        WHERE country_code=? AND parent_id IS NULL ORDER BY name`).bind('CN').all<RegionRow>(),
-      db.prepare(`SELECT community.province,COUNT(community.id) AS address_count
-        FROM cn_communities_v2 community WHERE ${chinaCommunityPublicationClause('community')}
-        GROUP BY community.province`).all<ChinaProvinceAvailabilityRow>()
-    ]);
-    const availability = new Map((availabilityResult.results || [])
-      .map((row) => [row.province.toLocaleLowerCase(), Number(row.address_count || 0)]));
-    const query = (input.query || '').trim().toLocaleLowerCase();
-    const unique = new Map<string, RegionRow>();
-    for (const row of regionResult.results || []) {
-      const key = row.name.toLocaleLowerCase();
-      if (!unique.has(key)) unique.set(key, row);
-    }
-    const matching = [...unique.values()].filter((row) => !query
-      || [row.name, row.native_name, row.zh_name, row.code].some((value) => value.toLocaleLowerCase().includes(query)));
-    const rows = matching.filter((row) => [row.name, row.native_name, row.zh_name].some((value) => (availability.get(value.toLocaleLowerCase()) || 0) > 0));
-    const current = page(rows.slice(offset, offset + limit), rows.length, offset);
-    return {
-      options: current.rows.map((row) => {
-        const availableCount = Math.max(...[row.name, row.native_name, row.zh_name]
-          .map((value) => availability.get(value.toLocaleLowerCase()) || 0));
-        return {
-          value: row.zh_name || row.native_name || row.name,
-          label: regionLabel(row, input.country),
-          availableCount,
-          disabled: Boolean(input.residential) && availableCount === 0,
-          id: String(row.id),
-           parentId: row.parent_id == null ? undefined : String(row.parent_id),
-           regionCode: row.code || undefined,
-           native: row.native_name,
-          en: row.name,
-          zhCN: row.zh_name
-        };
-      }),
-      total: rows.length,
-      availableTotal: matching.filter((row) => [row.name, row.native_name, row.zh_name]
-        .some((value) => (availability.get(value.toLocaleLowerCase()) || 0) > 0)).length,
-      nextCursor: current.nextCursor,
-      source: 'postgres'
-    };
-  }
-  const [catalog, groups] = await Promise.all([
-    loadCatalogRegions(db, input.country),
-    generationLocations(db, input)
-  ]);
-  const regionNames = regionAliasResolver(catalog);
-  const query = (input.query || '').trim().toLocaleLowerCase();
-  const unique = new Map<string, RegionRow & { availableCount: number }>();
-  for (const row of catalog.filter((row) => row.parent_id == null)) {
-    if (query && ![row.name, row.native_name, row.zh_name, row.code].some((value) => value.toLocaleLowerCase().includes(query))) continue;
-    const names = poolLocationAliases(regionNames(row.id));
-    const availableCount = groups.reduce((count, group) => count + (regionMatches(group, names) ? Number(group.address_count) : 0), 0);
-    const key = row.name.toLocaleLowerCase();
-    if (availableCount && !unique.has(key)) unique.set(key, { ...row, availableCount });
-  }
-  const rows = [...unique.values()];
-  const current = page(rows.slice(offset, offset + limit), rows.length, offset);
-  return {
-    options: current.rows.map((row) => ({
-      value: row.name, label: regionLabel(row, input.country), availableCount: row.availableCount, disabled: false,
-      id: String(row.id), regionCode: row.code || undefined, native: row.native_name, en: row.name, zhCN: row.zh_name
-    })),
-    total: rows.length, availableTotal: rows.length, nextCursor: current.nextCursor, source: 'postgres'
+const emptyPage: CatalogPage = { options: [], total: 0, availableTotal: 0, source: 'postgres' };
+
+// --- Per-country option snapshots ------------------------------------------------
+// Grouping a country's published addresses takes seconds, so each country's complete option lists are built
+// once and every request only filters, scopes and pages them. A snapshot is rebuilt in the background when it
+// is older than the TTL, or when publication has changed and the snapshot is old enough; requests meanwhile
+// keep receiving the previous snapshot.
+
+const SNAPSHOT_TTL_MS = 10 * 60_000;
+const SNAPSHOT_MIN_REBUILD_MS = 2 * 60_000;
+
+interface SnapshotEntry { revision: string; builtAt: number; value?: unknown; pending?: Promise<unknown> }
+const snapshotStore = new WeakMap<Database, Map<string, SnapshotEntry>>();
+
+const loadSnapshot = async <T,>(db: Database, key: string, revision: string, build: () => Promise<T>): Promise<{ value: T; revision: string }> => {
+  let store = snapshotStore.get(db);
+  if (!store) { store = new Map(); snapshotStore.set(db, store); }
+  const entries = store;
+  const entry = entries.get(key);
+  const rebuild = (): Promise<T> => {
+    const pending: Promise<T> = build().then((value) => {
+      if (entries.get(key)?.pending === pending) entries.set(key, { revision, builtAt: Date.now(), value });
+      return value;
+    }, (error: unknown) => {
+      const current = entries.get(key);
+      if (current?.pending === pending) {
+        if (current.value === undefined) entries.delete(key);
+        else entries.set(key, { revision: current.revision, builtAt: current.builtAt, value: current.value });
+      }
+      throw error;
+    });
+    entries.set(key, { revision: entry?.revision ?? revision, builtAt: entry?.builtAt ?? 0, value: entry?.value, pending });
+    return pending;
   };
+  if (entry?.value === undefined) return { value: await ((entry?.pending as Promise<T> | undefined) ?? rebuild()), revision };
+  const age = Date.now() - entry.builtAt;
+  if (!entry.pending && (age > SNAPSHOT_TTL_MS || (entry.revision !== revision && age > SNAPSHOT_MIN_REBUILD_MS))) {
+    rebuild().catch(() => undefined);
+  }
+  return { value: entry.value as T, revision: entry.revision };
 };
 
-const queryCities = async (db: Database, input: CatalogQuery, limit: number, offset: number): Promise<CatalogPage> => {
-  const regionId = await selectedRegion(db, input);
-  if ((input.region || input.regionId) && regionId === undefined) return emptyPage;
-  const scope = regionId === undefined ? '' : `AND c.region_id IN (
-    SELECT child.id FROM catalog_regions selected JOIN catalog_regions child
-      ON child.country_code=selected.country_code AND ${catalogDescendantClause}
-    WHERE selected.id=?)`;
-  const [catalog, groups, regionRows] = await Promise.all([
+interface SnapshotItem { option: LocationOption; search: string[] }
+interface CityItem extends SnapshotItem { regionId?: number; province?: string }
+interface DistrictItem extends SnapshotItem { province: string; city: string }
+interface RegionPath { id: number; path: string | null }
+interface AdminSnapshot {
+  regions: SnapshotItem[];
+  cities: CityItem[];
+  districts: DistrictItem[];
+  regionPaths: RegionPath[];
+  chinaRegions: ChinaRegionRow[];
+}
+
+const pageOf = (items: SnapshotItem[], limit: number, offset: number): CatalogPage => {
+  const rows = items.slice(offset, offset + limit);
+  return {
+    options: rows.map(({ option }) => option),
+    total: items.length,
+    availableTotal: items.length,
+    nextCursor: offset + rows.length < items.length ? String(offset + rows.length) : undefined,
+    source: 'postgres'
+  };
+};
+const searched = <T extends SnapshotItem>(items: T[], query: string | undefined, normalizeSearch: (value: string) => string): T[] => {
+  const needle = normalizeSearch(query || '');
+  return needle ? items.filter((item) => item.search.some((value) => value.includes(needle))) : items;
+};
+const descendantRegionIds = (paths: RegionPath[], regionId: number): Set<number> => {
+  const selected = paths.find((row) => Number(row.id) === regionId);
+  const prefix = selected?.path == null ? undefined : `${selected.path.replace(/\/+$/u, '')}/`;
+  return new Set([regionId, ...paths.filter((row) => prefix !== undefined && (row.path || '').startsWith(prefix))
+    .map((row) => Number(row.id))]);
+};
+
+const buildAdminSnapshot = async (db: Database, country: CountryCode, residential: boolean): Promise<AdminSnapshot> => {
+  const [catalog, groups, cityRows, regionPaths] = await Promise.all([
+    loadCatalogRegions(db, country),
+    generationLocations(db, country, residential),
     db.prepare(`SELECT c.id, c.region_id, c.name, c.native_name, c.zh_name,
       r.name AS region_name,r.native_name AS region_native_name,r.zh_name AS region_zh_name,r.code AS region_code
       FROM catalog_cities c LEFT JOIN catalog_regions r ON r.id=c.region_id
-      WHERE c.country_code=? ${scope} ORDER BY COALESCE(c.population,0) DESC,c.name,c.id`)
-      .bind(input.country, ...(regionId === undefined ? [] : [regionId])).all<CityRow>(),
-    generationLocations(db, input), loadCatalogRegions(db, input.country)
+      WHERE c.country_code=? ORDER BY COALESCE(c.population,0) DESC,c.name,c.id`).bind(country).all<CityRow>(),
+    db.prepare('SELECT id,path FROM catalog_regions WHERE country_code=?').bind(country).all<RegionPath>()
   ]);
-  const regionNames = regionAliasResolver(regionRows);
+  const regionNames = regionAliasResolver(catalog);
+  const regions = new Map<string, SnapshotItem>();
+  for (const row of catalog.filter((row) => row.parent_id == null)) {
+    const names = poolLocationAliases(regionNames(row.id));
+    const availableCount = groups.reduce((count, group) => count + (regionMatches(group, names) ? Number(group.address_count) : 0), 0);
+    const key = row.name.toLocaleLowerCase();
+    if (!availableCount || regions.has(key)) continue;
+    regions.set(key, {
+      option: {
+        value: row.name, label: regionLabel(row, country), availableCount, disabled: false,
+        id: String(row.id), regionCode: row.code || undefined, native: row.native_name, en: row.name, zhCN: row.zh_name
+      },
+      search: [row.name, row.native_name, row.zh_name, row.code].map(lowerKey)
+    });
+  }
   const byCity = new Map<string, Set<GenerationLocationGroup>>();
   for (const group of groups) for (const key of new Set([group.locality_key, group.postal_locality_key])) {
     if (!key) continue;
     const matches = byCity.get(key) || new Set<GenerationLocationGroup>();
     matches.add(group); byCity.set(key, matches);
   }
-  const query = (input.query || '').trim().toLocaleLowerCase();
-  const unique = new Map<string, CityRow & { availableCount: number }>();
-  for (const row of catalog.results) {
-    if (query && ![row.name, row.native_name, row.zh_name].some((value) => value.toLocaleLowerCase().includes(query))) continue;
-    const regions = poolLocationAliases(row.region_id == null ? [] : regionNames(row.region_id, true));
+  const cities = new Map<string, CityItem>();
+  for (const row of cityRows.results || []) {
+    const parentRegions = poolLocationAliases(row.region_id == null ? [] : regionNames(row.region_id, true));
     const matches = new Set<GenerationLocationGroup>();
     for (const name of poolLocationAliases(cityAliases(row.name, row.native_name, row.zh_name))) {
-      for (const group of byCity.get(name) || []) if (regionMatches(group, regions)) matches.add(group);
+      for (const group of byCity.get(name) || []) if (regionMatches(group, parentRegions)) matches.add(group);
     }
     const availableCount = [...matches].reduce((sum, group) => sum + Number(group.address_count), 0);
     const key = `${row.name.toLocaleLowerCase()}:${(row.region_name || row.region_code || '').toLocaleLowerCase()}`;
-    if (availableCount && !unique.has(key)) unique.set(key, { ...row, availableCount });
+    if (!availableCount || cities.has(key)) continue;
+    cities.set(key, {
+      option: {
+        value: row.name, label: cityLabel(row, country), availableCount, disabled: false,
+        id: String(row.id), parentId: row.region_id == null ? undefined : String(row.region_id),
+        parentValue: row.region_name || undefined,
+        parentLabel: row.region_name ? regionLabel({
+          id: row.region_id || 0, parent_id: null, code: row.region_code || '', name: row.region_name,
+          native_name: row.region_native_name || row.region_name, zh_name: row.region_zh_name || row.region_name
+        }, country) : undefined,
+        regionId: row.region_id == null ? undefined : String(row.region_id), regionValue: row.region_name || undefined,
+        regionCode: row.region_code || undefined, native: row.native_name, en: row.name, zhCN: row.zh_name
+      },
+      search: [row.name, row.native_name, row.zh_name].map(lowerKey),
+      regionId: row.region_id == null ? undefined : Number(row.region_id)
+    });
   }
-  const rows = [...unique.values()];
-  const current = page(rows.slice(offset, offset + limit), rows.length, offset);
-  return {
-    options: current.rows.map((row) => ({
-      value: row.name, label: cityLabel(row, input.country), availableCount: row.availableCount, disabled: false,
-      id: String(row.id), parentId: row.region_id == null ? undefined : String(row.region_id),
-      parentValue: row.region_name || undefined,
-      parentLabel: row.region_name ? regionLabel({
-        id: row.region_id || 0, parent_id: null, code: row.region_code || '', name: row.region_name,
-        native_name: row.region_native_name || row.region_name, zh_name: row.region_zh_name || row.region_name
-      }, input.country) : undefined,
-      regionId: row.region_id == null ? undefined : String(row.region_id), regionValue: row.region_name || undefined,
-      regionCode: row.region_code || undefined, native: row.native_name, en: row.name, zhCN: row.zh_name
-    })),
-    total: rows.length, availableTotal: rows.length, nextCursor: current.nextCursor, source: 'postgres'
-  };
+  return { regions: [...regions.values()], cities: [...cities.values()], districts: [], regionPaths: regionPaths.results || [], chinaRegions: [] };
 };
 
-interface DistrictRow { district: string; address_count: number }
+const queryCities = async (db: Database, input: CatalogQuery, snapshot: AdminSnapshot, limit: number, offset: number): Promise<CatalogPage> => {
+  const regionId = await selectedRegion(db, input);
+  if ((input.region || input.regionId) && regionId === undefined) return emptyPage;
+  const scope = regionId === undefined ? undefined : descendantRegionIds(snapshot.regionPaths, regionId);
+  const scoped = scope ? snapshot.cities.filter((item) => item.regionId !== undefined && scope.has(item.regionId)) : snapshot.cities;
+  return pageOf(searched(scoped, input.query, lowerKey), limit, offset);
+};
 
-const emptyPage: CatalogPage = { options: [], total: 0, availableTotal: 0, source: 'postgres' };
-
-// --- China community-backed city options -----------------------------------
+// --- China community-backed options ------------------------------------------------
 // The dr5hn catalog models CN unreliably (districts listed as cities, "X" and
-// "X Shi" duplicates, mistranslated zh names), so CN city options are served
-// from the published communities themselves and only mapped back to catalog
+// "X Shi" duplicates, mistranslated zh names), so CN options are served from the
+// published communities themselves and cities are only mapped back to catalog
 // ids so the /v1/generate catalog gate keeps working.
 
+interface ChinaGroupRow { province: string; city: string; district: string; address_count: number }
 interface ChinaCityGroupRow { province: string; city: string; address_count: number }
 interface ChinaCatalogCityRow { id: number; region_id: number | null; name: string; native_name: string; zh_name: string; population: number | null }
-interface ChinaRegionRow { id: number; code: string; name: string; native_name: string; zh_name: string }
+interface ChinaRegionRow { id: number; parent_id?: number | null; code: string; name: string; native_name: string; zh_name: string }
 
 export const CN_SYNTHETIC_CITY_PREFIX = 'cn-city-';
 export const CN_SYNTHETIC_DISTRICT_PREFIX = 'cn-district-';
@@ -260,30 +274,31 @@ const cnCityStem = (value: string): string => {
 };
 const romanizeChinese = (value: string): string => pinyin(value, { toneType: 'none', type: 'array', nonZh: 'consecutive' })
   .map((part) => part.trim()).filter(Boolean).join(' ').replace(/^\p{Ll}/u, (first) => first.toUpperCase());
-const syntheticCityId = (city: string): string => `${CN_SYNTHETIC_CITY_PREFIX}${Buffer.from(city, 'utf8').toString('hex')}`;
-export const decodeSyntheticCityId = (id: string | undefined): string | undefined => {
-  if (!id?.startsWith(CN_SYNTHETIC_CITY_PREFIX)) return undefined;
-  const hex = id.slice(CN_SYNTHETIC_CITY_PREFIX.length);
+const hexId = (prefix: string, value: string): string => `${prefix}${Buffer.from(value, 'utf8').toString('hex')}`;
+const decodeHexId = (prefix: string, id: string | undefined): string | undefined => {
+  if (!id?.startsWith(prefix)) return undefined;
+  const hex = id.slice(prefix.length);
   if (!/^[0-9a-f]+$/u.test(hex) || hex.length % 2 !== 0) return undefined;
   const value = Buffer.from(hex, 'hex').toString('utf8');
   return value.trim() && Buffer.from(value, 'utf8').toString('hex') === hex ? value : undefined;
 };
-const syntheticDistrictId = (district: string): string => `${CN_SYNTHETIC_DISTRICT_PREFIX}${Buffer.from(district, 'utf8').toString('hex')}`;
-export const decodeSyntheticDistrictId = (id: string | undefined): string | undefined => {
-  if (!id?.startsWith(CN_SYNTHETIC_DISTRICT_PREFIX)) return undefined;
-  const hex = id.slice(CN_SYNTHETIC_DISTRICT_PREFIX.length);
-  if (!/^[0-9a-f]+$/u.test(hex) || hex.length % 2 !== 0) return undefined;
-  const value = Buffer.from(hex, 'hex').toString('utf8');
-  return value.trim() && Buffer.from(value, 'utf8').toString('hex') === hex ? value : undefined;
+const syntheticCityId = (city: string): string => hexId(CN_SYNTHETIC_CITY_PREFIX, city);
+export const decodeSyntheticCityId = (id: string | undefined): string | undefined => decodeHexId(CN_SYNTHETIC_CITY_PREFIX, id);
+// District ids carry their province and city because district names repeat across cities (朝阳区, 鼓楼区).
+const DISTRICT_ID_SEPARATOR = '\u001f';
+const syntheticDistrictId = (province: string, city: string, district: string): string =>
+  hexId(CN_SYNTHETIC_DISTRICT_PREFIX, [province, city, district].join(DISTRICT_ID_SEPARATOR));
+export const decodeSyntheticDistrict = (id: string | undefined): { province?: string; city?: string; district: string } | undefined => {
+  const parts = decodeHexId(CN_SYNTHETIC_DISTRICT_PREFIX, id)?.split(DISTRICT_ID_SEPARATOR);
+  if (!parts?.at(-1)?.trim() || (parts.length !== 1 && parts.length !== 3)) return undefined;
+  return parts.length === 1 ? { district: parts[0] } : { province: parts[0] || undefined, city: parts[1] || undefined, district: parts[2] };
 };
+export const decodeSyntheticDistrictId = (id: string | undefined): string | undefined => decodeSyntheticDistrict(id)?.district;
 const searchableKey = (value: string): string => (value || '')
   .normalize('NFKD').replace(/[̀-ͯ]/g, '').toLocaleLowerCase().replace(/[\s\-'･·]/g, '');
 
-const chinaRegions = async (db: Database): Promise<ChinaRegionRow[]> =>
-  (await db.prepare(`SELECT id, code, name, native_name, zh_name FROM catalog_regions WHERE country_code = ? AND parent_id IS NULL`)
-    .bind('CN').all<ChinaRegionRow>()).results || [];
-
 const stripProvinceSuffix = (value: string): string => (value || '').replace(/省$/u, '');
+const stripCitySuffix = (value: string): string => (value || '').replace(/市/gu, '');
 
 const matchChinaRegion = (regions: ChinaRegionRow[], regionId?: string, region?: string): ChinaRegionRow | undefined => {
   const id = Number.parseInt(regionId || '', 10);
@@ -295,6 +310,10 @@ const matchChinaRegion = (regions: ChinaRegionRow[], regionId?: string, region?:
     const lowered = (name || '').toLocaleLowerCase();
     return lowered === needle || stripProvinceSuffix(lowered) === stripped;
   }));
+};
+const inChinaRegion = (province: string, region: ChinaRegionRow): boolean => {
+  const names = [region.name, region.native_name, region.zh_name];
+  return names.includes(province) || names.map(stripProvinceSuffix).includes(stripProvinceSuffix(province));
 };
 
 const chinaCatalogCandidates = async (db: Database, cities: string[]): Promise<Map<string, ChinaCatalogCityRow[]>> => {
@@ -349,208 +368,212 @@ const chinaMunicipalityProxy = async (
     .bind('CN', province.id).first<ChinaCatalogCityRow>() || undefined;
 };
 
-const queryChinaCities = async (db: Database, input: CatalogQuery, limit: number, offset: number): Promise<CatalogPage> => {
-  const regions = await chinaRegions(db);
-  const scoped = Boolean((input.regionId || '').trim() || (input.region || '').trim());
-  const regionRow = matchChinaRegion(regions, input.regionId, input.region);
-  if (scoped && !regionRow) return emptyPage;
-  const clauses = [chinaCommunityPublicationClause('community'), `community.city <> ''`];
-  const bindings: unknown[] = [];
-  if (regionRow) {
-    clauses.push(`(community.province IN (?,?,?) OR REPLACE(community.province,'省','') IN (?,?,?))`);
-    bindings.push(regionRow.name, regionRow.native_name, regionRow.zh_name,
-      stripProvinceSuffix(regionRow.name), stripProvinceSuffix(regionRow.native_name), stripProvinceSuffix(regionRow.zh_name));
-  }
-  const grouped = (await db.prepare(`SELECT community.province AS province, community.city AS city, COUNT(community.id) AS address_count
-    FROM cn_communities_v2 community WHERE ${clauses.join(' AND ')}
-    GROUP BY community.province, community.city`).bind(...bindings).all<ChinaCityGroupRow>()).results || [];
-  if (!grouped.length) return emptyPage;
+const sumBy = <T,>(rows: T[], key: (row: T) => string, count: (row: T) => number): Map<string, number> => {
+  const totals = new Map<string, number>();
+  for (const row of rows) totals.set(key(row), (totals.get(key(row)) || 0) + count(row));
+  return totals;
+};
 
-  const candidatesByStem = await chinaCatalogCandidates(db, grouped.map((row) => row.city));
-  const regionByName = new Map<string, ChinaRegionRow>();
-  for (const region of regions) {
-    for (const name of [region.name, region.native_name, region.zh_name]) {
-      if (name) regionByName.set(name.toLocaleLowerCase(), region);
-    }
-  }
-
-  const entries = grouped.map((row) => {
-    const province = regionByName.get(row.province.toLocaleLowerCase());
-    const catalogCity = pickChinaCatalogCity(candidatesByStem, row.city, province);
-    return { row, province, catalogCity, en: catalogCity?.name || romanizeChinese(row.city) };
-  });
-  const needle = searchableKey(input.query || '');
-  const filtered = entries
-    .filter((entry) => !needle || [entry.row.city, cnCityStem(entry.row.city), entry.en].some((value) => searchableKey(value).includes(needle)))
-    .sort((left, right) => right.row.address_count - left.row.address_count
-      || left.row.city.localeCompare(right.row.city, 'zh-CN'));
-  const total = filtered.length;
-  const slice = filtered.slice(offset, offset + limit);
-
-  const options: LocationOption[] = [];
-  for (const entry of slice) {
-    const catalogCity = entry.catalogCity || await chinaMunicipalityProxy(db, entry.province, entry.row);
-    const availableCount = Number(entry.row.address_count || 0);
-    options.push({
-      value: entry.row.city,
-      label: entry.row.city,
-      availableCount,
-      disabled: Boolean(input.residential) && availableCount === 0,
-      id: catalogCity ? String(catalogCity.id) : syntheticCityId(entry.row.city),
-      parentId: entry.province ? String(entry.province.id) : undefined,
-      parentValue: entry.province?.zh_name || entry.row.province,
-      parentLabel: entry.province?.zh_name || entry.row.province,
-      regionId: entry.province ? String(entry.province.id) : undefined,
-      regionValue: entry.province?.zh_name || entry.row.province,
-      regionCode: entry.province?.code || undefined,
-      native: entry.row.city,
-      en: entry.en,
-      zhCN: entry.row.city
+const buildChinaAdminSnapshot = async (db: Database): Promise<AdminSnapshot> => {
+  const [regionResult, groupResult] = await Promise.all([
+    db.prepare(`SELECT id,parent_id,code,name,native_name,zh_name FROM catalog_regions
+      WHERE country_code=? AND parent_id IS NULL ORDER BY name`).bind('CN').all<ChinaRegionRow>(),
+    db.prepare(`SELECT community.province AS province,community.city AS city,community.district AS district,
+        COUNT(community.id) AS address_count
+      FROM cn_communities_v2 community WHERE ${chinaCommunityPublicationClause('community')}
+      GROUP BY community.province,community.city,community.district`).all<ChinaGroupRow>()
+  ]);
+  const chinaRegions = regionResult.results || [];
+  const groups = (groupResult.results || []).map((row) => ({ ...row, city: row.city || '', district: row.district || '' }));
+  const provinceCounts = sumBy(groups, (row) => row.province.toLocaleLowerCase(), (row) => Number(row.address_count || 0));
+  const regions = new Map<string, SnapshotItem>();
+  for (const row of chinaRegions) {
+    const key = row.name.toLocaleLowerCase();
+    const availableCount = Math.max(...[row.name, row.native_name, row.zh_name].map((value) => provinceCounts.get(value.toLocaleLowerCase()) || 0));
+    if (!availableCount || regions.has(key)) continue;
+    regions.set(key, {
+      option: {
+        value: row.zh_name || row.native_name || row.name, label: regionLabel({ parent_id: null, ...row }, 'CN'),
+        availableCount, disabled: false, id: String(row.id),
+        parentId: row.parent_id == null ? undefined : String(row.parent_id),
+        regionCode: row.code || undefined, native: row.native_name, en: row.name, zhCN: row.zh_name
+      },
+      search: [row.name, row.native_name, row.zh_name, row.code].map(lowerKey)
     });
   }
-  return {
-    options,
-    total,
-    availableTotal: total,
-    nextCursor: offset + options.length < total ? String(offset + options.length) : undefined,
-    source: 'postgres'
-  };
+  const regionByName = new Map<string, ChinaRegionRow>();
+  for (const region of chinaRegions) {
+    for (const name of [region.name, region.native_name, region.zh_name]) if (name) regionByName.set(name.toLocaleLowerCase(), region);
+  }
+  const cityGroups: ChinaCityGroupRow[] = [...sumBy(groups.filter((row) => row.city), (row) => `${row.province}\u0000${row.city}`,
+    (row) => Number(row.address_count || 0))].map(([key, address_count]) => {
+    const [province, city] = key.split('\u0000');
+    return { province, city, address_count };
+  });
+  const candidatesByStem = await chinaCatalogCandidates(db, cityGroups.map((row) => row.city));
+  const cities: CityItem[] = [];
+  const cityIds = new Map<string, string>();
+  for (const row of cityGroups) {
+    const province = regionByName.get(row.province.toLocaleLowerCase());
+    const catalogCity = pickChinaCatalogCity(candidatesByStem, row.city, province) || await chinaMunicipalityProxy(db, province, row);
+    const en = catalogCity?.name || romanizeChinese(row.city);
+    const id = catalogCity ? String(catalogCity.id) : syntheticCityId(row.city);
+    cityIds.set(`${row.province}\u0000${row.city}`, id);
+    cities.push({
+      option: {
+        value: row.city, label: row.city, availableCount: row.address_count, disabled: false, id,
+        parentId: province ? String(province.id) : undefined,
+        parentValue: province?.zh_name || row.province, parentLabel: province?.zh_name || row.province,
+        regionId: province ? String(province.id) : undefined, regionValue: province?.zh_name || row.province,
+        regionCode: province?.code || undefined, native: row.city, en: catalogCity?.name || en, zhCN: row.city
+      },
+      search: [row.city, cnCityStem(row.city), en].map(searchableKey),
+      province: row.province
+    });
+  }
+  cities.sort((left, right) => Number(right.option.availableCount) - Number(left.option.availableCount)
+    || left.option.value.localeCompare(right.option.value, 'zh-CN'));
+  const districts: DistrictItem[] = groups.filter((row) => row.district).map((row) => {
+    const province = regionByName.get(row.province.toLocaleLowerCase());
+    const provinceName = province?.zh_name || row.province;
+    const en = chinaEnglishComponent('district', row.district);
+    return {
+      option: {
+        id: syntheticDistrictId(row.province, row.city, row.district), value: row.district, label: row.district,
+        availableCount: Number(row.address_count || 0), disabled: false,
+        parentId: cityIds.get(`${row.province}\u0000${row.city}`), parentValue: row.city || undefined,
+        parentLabel: [...new Set([row.city, provinceName].filter(Boolean))].join(' · ') || undefined,
+        regionId: province ? String(province.id) : undefined, regionValue: provinceName, regionCode: province?.code || undefined,
+        native: row.district, en, zhCN: row.district
+      },
+      search: [row.district, en].map(searchableKey),
+      province: row.province,
+      city: row.city
+    };
+  }).sort((left, right) => Number(right.option.availableCount) - Number(left.option.availableCount)
+    || left.option.value.localeCompare(right.option.value, 'zh-CN')
+    || String(left.option.parentLabel).localeCompare(String(right.option.parentLabel), 'zh-CN'));
+  return { regions: [...regions.values()], cities, districts, regionPaths: [], chinaRegions };
+};
+
+const queryChinaCities = (input: CatalogQuery, snapshot: AdminSnapshot, limit: number, offset: number): CatalogPage => {
+  const scoped = Boolean((input.regionId || '').trim() || (input.region || '').trim());
+  const region = matchChinaRegion(snapshot.chinaRegions, input.regionId, input.region);
+  if (scoped && !region) return emptyPage;
+  const cities = region ? snapshot.cities.filter((item) => inChinaRegion(item.province || '', region)) : snapshot.cities;
+  return pageOf(searched(cities, input.query, searchableKey), limit, offset);
 };
 
 // China is the only country with a served district level; its published
 // communities are the authoritative catalog, so every option has coverage
 // and an uncovered district can never be selected (exact-or-empty rule).
-const queryDistricts = async (db: Database, input: CatalogQuery, limit: number, offset: number): Promise<CatalogPage> => {
-  if (input.country !== 'CN') return emptyPage;
-  const clauses = [chinaCommunityPublicationClause('community'), `community.district <> ''`];
-  const bindings: unknown[] = [];
+const queryDistricts = async (db: Database, input: CatalogQuery, snapshot: AdminSnapshot, limit: number, offset: number): Promise<CatalogPage> => {
+  let districts = snapshot.districts;
   const regionId = Number.parseInt(input.regionId || '', 10);
   if (Number.isFinite(regionId)) {
-    clauses.push(`community.province IN (SELECT name FROM catalog_regions WHERE id = ?
-      UNION SELECT native_name FROM catalog_regions WHERE id = ?
-      UNION SELECT zh_name FROM catalog_regions WHERE id = ?)`);
-    bindings.push(regionId, regionId, regionId);
+    const region = snapshot.chinaRegions.find((row) => Number(row.id) === regionId);
+    const names = region ? [region.name, region.native_name, region.zh_name] : [];
+    districts = districts.filter((item) => names.includes(item.province));
   } else if (input.region?.trim()) {
-    clauses.push(`(community.province = ? OR REPLACE(community.province,'省','') = REPLACE(?,'省',''))`);
-    bindings.push(input.region.trim(), input.region.trim());
+    const region = input.region.trim();
+    districts = districts.filter((item) => item.province === region || stripProvinceSuffix(item.province) === stripProvinceSuffix(region));
   }
   const syntheticCity = decodeSyntheticCityId(input.cityId);
   const cityId = Number.parseInt(input.cityId || '', 10);
   if (syntheticCity) {
-    clauses.push(`(community.city = ? OR REPLACE(community.city,'市','') = REPLACE(?,'市',''))`);
-    bindings.push(syntheticCity, syntheticCity);
+    districts = districts.filter((item) => item.city === syntheticCity || stripCitySuffix(item.city) === stripCitySuffix(syntheticCity));
   } else if (Number.isFinite(cityId)) {
     // Suffix tolerance: the catalog stores 北京/唐山 while communities store
     // 北京市/唐山市. Municipality proxies (Shanghai has no city-proper catalog
     // row) resolve through their parent region instead.
-    clauses.push(`(community.city IN (SELECT name FROM catalog_cities WHERE id = ?
-        UNION SELECT native_name FROM catalog_cities WHERE id = ?
-        UNION SELECT zh_name FROM catalog_cities WHERE id = ?)
-      OR REPLACE(community.city,'市','') IN (SELECT REPLACE(name,'市','') FROM catalog_cities WHERE id = ?
-        UNION SELECT REPLACE(native_name,'市','') FROM catalog_cities WHERE id = ?
-        UNION SELECT REPLACE(zh_name,'市','') FROM catalog_cities WHERE id = ?)
-      OR (community.city = community.province AND community.province IN (
-        SELECT region.name FROM catalog_regions region JOIN catalog_cities city_ref ON city_ref.region_id = region.id WHERE city_ref.id = ?
-        UNION SELECT region.native_name FROM catalog_regions region JOIN catalog_cities city_ref ON city_ref.region_id = region.id WHERE city_ref.id = ?
-        UNION SELECT region.zh_name FROM catalog_regions region JOIN catalog_cities city_ref ON city_ref.region_id = region.id WHERE city_ref.id = ?)))`);
-    bindings.push(cityId, cityId, cityId, cityId, cityId, cityId, cityId, cityId, cityId);
+    const city = await db.prepare('SELECT id,region_id,name,native_name,zh_name FROM catalog_cities WHERE id = ?')
+      .bind(cityId).first<ChinaCatalogCityRow>();
+    const names = city ? [city.name, city.native_name, city.zh_name] : [];
+    const parent = city?.region_id == null ? undefined : snapshot.chinaRegions.find((row) => Number(row.id) === Number(city.region_id));
+    const parentNames = parent ? [parent.name, parent.native_name, parent.zh_name] : [];
+    districts = districts.filter((item) => names.includes(item.city) || names.map(stripCitySuffix).includes(stripCitySuffix(item.city))
+      || (item.city === item.province && parentNames.includes(item.province)));
   }
-  clauses.push(`LOWER(community.district) LIKE ? ESCAPE '\\'`);
-  bindings.push(searchPattern(input.query));
-  const where = clauses.join(' AND ');
-  const count = await db.prepare(`SELECT COUNT(DISTINCT community.district) AS total
-    FROM cn_communities_v2 community WHERE ${where}`).bind(...bindings).first<{ total: number }>();
-  const result = await db.prepare(`SELECT community.district AS district, COUNT(community.id) AS address_count
-    FROM cn_communities_v2 community WHERE ${where}
-    GROUP BY community.district ORDER BY community.district LIMIT ? OFFSET ?`)
-    .bind(...bindings, limit, offset).all<DistrictRow>();
-  const total = Number(count?.total || 0);
-  const current = page(result.results || [], total, offset);
-  return {
-    options: current.rows.map((row) => {
-      const availableCount = Number(row.address_count || 0);
-      return {
-        id: syntheticDistrictId(row.district), value: row.district, label: row.district, availableCount,
-        disabled: input.residential && availableCount === 0,
-        native: row.district, en: row.district, zhCN: row.district
-      };
-    }),
-    total,
-    availableTotal: total,
-    nextCursor: current.nextCursor,
-    source: 'postgres'
-  };
+  return pageOf(searched(districts, input.query, searchableKey), limit, offset);
 };
 
-const queryPostcodes = async (db: Database, input: CatalogQuery, limit: number, offset: number): Promise<CatalogPage> => {
+// --- Postcodes ---------------------------------------------------------------------
+
+interface PostcodeGroup extends GenerationLocationGroup { postcode_key: string }
+interface PostcodeCatalogRow extends Omit<PostcodeRow, 'address_count' | 'city_count' | 'region_count'> { postcode_key: string }
+interface PostcodeSnapshot {
+  groups: PostcodeGroup[]; totals: Array<[string, number]>; catalog: Map<string, PostcodeCatalogRow[]>; regionPaths: RegionPath[];
+}
+const byPostcodeKey = (left: [string, number], right: [string, number]): number => left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
+
+const buildPostcodeSnapshot = async (db: Database, country: CountryCode, residential: boolean): Promise<PostcodeSnapshot> => {
+  const scope = `country_code=? AND active=1 AND postcode_key<>''${residential ? ' AND residential_ready=1' : ''}`;
+  const [groups, catalog, regionPaths] = await Promise.all([
+    db.prepare(`SELECT postcode_key,admin1_key,admin1_code_key,locality_key,postal_locality_key,COUNT(*) AS address_count
+      FROM address_generation_index WHERE ${scope}
+      GROUP BY postcode_key,admin1_key,admin1_code_key,locality_key,postal_locality_key`).bind(country).all<PostcodeGroup>(),
+    db.prepare(`SELECT p.id,p.city_id,p.code,p.locality_name,LOWER(REPLACE(p.code,' ','')) AS postcode_key,
+        c.name AS city_name,c.native_name AS city_native_name,c.zh_name AS city_zh_name,
+        COALESCE(p.region_id,c.region_id) AS region_id,r.name AS region_name,r.native_name AS region_native_name,
+        r.zh_name AS region_zh_name,r.code AS region_code
+      FROM catalog_postcodes p LEFT JOIN catalog_cities c ON c.id=p.city_id
+      LEFT JOIN catalog_regions r ON r.id=COALESCE(p.region_id,c.region_id)
+      WHERE p.country_code=? AND LOWER(REPLACE(p.code,' ','')) IN (
+        SELECT DISTINCT postcode_key FROM address_generation_index WHERE ${scope})
+      ORDER BY p.id`).bind(country, country).all<PostcodeCatalogRow>(),
+    db.prepare('SELECT id,path FROM catalog_regions WHERE country_code=?').bind(country).all<RegionPath>()
+  ]);
+  const byKey = new Map<string, PostcodeCatalogRow[]>();
+  for (const row of catalog.results || []) {
+    const rows = byKey.get(row.postcode_key);
+    if (rows) rows.push(row); else byKey.set(row.postcode_key, [row]);
+  }
+  const rows = groups.results || [];
+  const totals = [...sumBy(rows, (group) => group.postcode_key, (group) => Number(group.address_count))].sort(byPostcodeKey);
+  return { groups: rows, totals, catalog: byKey, regionPaths: regionPaths.results || [] };
+};
+
+const uniqueOf = (rows: PostcodeCatalogRow[], key: (row: PostcodeCatalogRow) => number | null): boolean =>
+  rows.length > 0 && rows.every((row) => key(row) != null) && new Set(rows.map(key)).size === 1;
+
+const queryPostcodes = async (db: Database, input: CatalogQuery, snapshot: PostcodeSnapshot, limit: number, offset: number): Promise<CatalogPage> => {
   const hasParent = Boolean(input.region || input.regionId || input.city || input.cityId);
   const target = hasParent ? await resolveCatalogTarget(db, input.country, input, 'catalog-options') : undefined;
   if (hasParent && !target) return emptyPage;
-  const clauses = ['country_code=?', 'active=1', "postcode_key<>''"];
-  const generationBindings: unknown[] = [input.country];
-  if (input.residential) clauses.push('residential_ready=1');
-  const regionClause = aliasClauseValues(['admin1_key', 'admin1_code_key'],
-    poolLocationAliases([input.region, ...target?.regionAliases || []]));
-  if (regionClause) {
-    clauses.push(regionClause.sql);
-    generationBindings.push(...regionClause.values);
-  }
-  const cityClause = aliasClauseValues(['locality_key', 'postal_locality_key'],
-    poolLocationAliases([input.city, ...target?.cityAliases || []]));
-  if (cityClause) {
-    clauses.push(cityClause.sql);
-    generationBindings.push(...cityClause.values);
-  }
-  const where = ['p.country_code=?'];
-  const bindings: unknown[] = [input.country];
-  if (target?.regionId) {
-    where.push(`COALESCE(p.region_id,c.region_id) IN (SELECT child.id FROM catalog_regions selected
-      JOIN catalog_regions child ON child.country_code=selected.country_code
-        AND ${catalogDescendantClause} WHERE selected.id=?)`);
-    bindings.push(target.regionId);
-  }
-  if (target?.cityId) {
-    where.push(`(p.city_id=? OR LOWER(p.locality_name) IN (SELECT LOWER(name) FROM catalog_cities WHERE id=?
-      UNION SELECT LOWER(native_name) FROM catalog_cities WHERE id=?))`);
-    bindings.push(target.cityId, target.cityId, target.cityId);
-  }
-  const search = input.query?.trim()
-    ? 'WHERE available.postcode_key LIKE ? OR LOWER(p.locality_name) LIKE ?' : '';
-  const searchBindings = search ? [searchPattern(input.query!.replace(/\s/gu, '')), searchPattern(input.query)] : [];
-  const cte = `WITH available_postcodes AS (
-      SELECT postcode_key,COUNT(*) AS address_count FROM address_generation_index
-      WHERE ${clauses.join(' AND ')} GROUP BY postcode_key
-    ), catalog_matches AS (
-      SELECT p.id,p.code,p.city_id,p.locality_name,COALESCE(p.region_id,c.region_id) AS region_id
-      FROM catalog_postcodes p LEFT JOIN catalog_cities c ON c.id=p.city_id
-      WHERE ${where.join(' AND ')}
-    ), available_options AS (
-      SELECT available.postcode_key,MIN(p.id) AS id,MAX(available.address_count) AS address_count,
-        CASE WHEN COUNT(DISTINCT p.city_id)=1 AND COUNT(p.city_id)=COUNT(*) THEN 1 ELSE 0 END AS city_count,
-        CASE WHEN COUNT(DISTINCT p.region_id)=1 AND COUNT(p.region_id)=COUNT(*) THEN 1 ELSE 0 END AS region_count
-      FROM available_postcodes available LEFT JOIN catalog_matches p
-        ON available.postcode_key=LOWER(REPLACE(p.code,' ',''))
-      ${search} GROUP BY available.postcode_key
-    )`;
-  const values = [...generationBindings, ...bindings, ...searchBindings];
-  const count = await db.prepare(`${cte} SELECT COUNT(*) AS total FROM available_options`).bind(...values).first<{ total: number }>();
-  const total = Number(count?.total || 0);
-  if (!total) return emptyPage;
-  const result = await db.prepare(`${cte} SELECT p.id,p.city_id,COALESCE(p.code,UPPER(available.postcode_key)) AS code,p.locality_name,
-      c.name AS city_name,c.native_name AS city_native_name,c.zh_name AS city_zh_name,
-      COALESCE(p.region_id,c.region_id) AS region_id,r.name AS region_name,r.native_name AS region_native_name,
-      r.zh_name AS region_zh_name,r.code AS region_code,available.address_count,available.city_count,available.region_count
-    FROM available_options available LEFT JOIN catalog_postcodes p ON p.id=available.id
-    LEFT JOIN catalog_cities c ON c.id=p.city_id LEFT JOIN catalog_regions r ON r.id=COALESCE(p.region_id,c.region_id)
-    ORDER BY available.postcode_key,available.id LIMIT ? OFFSET ?`).bind(...values, limit, offset).all<PostcodeRow>();
-  const current = page(result.results || [], total, offset);
-  return {
-    options: current.rows.map((row) => {
-      const cityKnown = Number(row.city_count) === 1;
-      const regionKnown = Number(row.region_count) === 1;
-      return {
-        value: row.code, label: [row.code, cityKnown && row.locality_name, regionKnown && row.region_name].filter(Boolean).join(' · '),
-        availableCount: Number(row.address_count), disabled: false, id: row.id == null ? undefined : String(row.id),
+  const regionAliases = new Set(poolLocationAliases([input.region, ...target?.regionAliases || []]));
+  const cityAliases = new Set(poolLocationAliases([input.city, ...target?.cityAliases || []]));
+  const available = !regionAliases.size && !cityAliases.size ? snapshot.totals : [...sumBy(snapshot.groups.filter((group) =>
+    (!regionAliases.size || regionAliases.has(group.admin1_key) || regionAliases.has(group.admin1_code_key))
+    && (!cityAliases.size || cityAliases.has(group.locality_key) || cityAliases.has(group.postal_locality_key))),
+  (group) => group.postcode_key, (group) => Number(group.address_count))].sort(byPostcodeKey);
+  const regionScope = target?.regionId ? descendantRegionIds(snapshot.regionPaths, Number(target.regionId)) : undefined;
+  const cityNames = new Set([target?.city, target?.cityNative].filter(Boolean).map((name) => name!.toLowerCase()));
+  const keyNeedle = input.query?.trim() ? input.query.trim().toLocaleLowerCase().replace(/\s/gu, '') : '';
+  const localityNeedle = input.query?.trim().toLocaleLowerCase() || '';
+  const scoped = Boolean(regionScope || target?.cityId);
+  const options = available.flatMap(([postcodeKey, addressCount]) => {
+    let rows = snapshot.catalog.get(postcodeKey) || [];
+    if (scoped) rows = rows.filter((row) =>
+      (!regionScope || (row.region_id != null && regionScope.has(Number(row.region_id))))
+      && (!target?.cityId || Number(row.city_id) === Number(target.cityId) || cityNames.has((row.locality_name || '').toLowerCase())));
+    if (keyNeedle && !postcodeKey.includes(keyNeedle)) {
+      rows = rows.filter((row) => (row.locality_name || '').toLowerCase().includes(localityNeedle));
+      if (!rows.length) return [];
+    }
+    return [{ postcodeKey, addressCount, rows }];
+  });
+  if (!options.length) return emptyPage;
+  // Only the requested page becomes options; large countries have tens of thousands of postcodes.
+  const items: SnapshotItem[] = options.slice(offset, offset + limit).map(({ postcodeKey, addressCount, rows }) => {
+    const row = rows[0];
+    const code = row?.code || postcodeKey.toUpperCase();
+    const cityKnown = uniqueOf(rows, (entry) => entry.city_id);
+    const regionKnown = uniqueOf(rows, (entry) => entry.region_id);
+    return {
+      search: [],
+      option: {
+        value: code, label: [code, cityKnown && row.locality_name, regionKnown && row.region_name].filter(Boolean).join(' · '),
+        availableCount: addressCount, disabled: false, id: row?.id == null ? undefined : String(row.id),
         parentId: cityKnown && row.city_id != null ? String(row.city_id) : undefined,
         parentValue: cityKnown ? row.city_name || row.locality_name || undefined : undefined,
         parentLabel: cityKnown ? row.city_name || row.locality_name || undefined : undefined,
@@ -561,58 +584,52 @@ const queryPostcodes = async (db: Database, input: CatalogQuery, limit: number, 
           native_name: row.region_native_name || row.region_name, zh_name: row.region_zh_name || row.region_name
         }, input.country) : undefined,
         regionCode: regionKnown ? row.region_code || undefined : undefined,
-        native: [row.code, cityKnown && (row.city_native_name || row.locality_name)].filter(Boolean).join(' · '),
-        en: [row.code, cityKnown && (row.city_name || row.locality_name)].filter(Boolean).join(' · '),
-        zhCN: [row.code, cityKnown && (row.city_zh_name || row.locality_name)].filter(Boolean).join(' · ')
-      };
-    }),
-    total, availableTotal: total, nextCursor: current.nextCursor, source: 'postgres'
+        native: [code, cityKnown && (row.city_native_name || row.locality_name)].filter(Boolean).join(' · '),
+        en: [code, cityKnown && (row.city_name || row.locality_name)].filter(Boolean).join(' · '),
+        zhCN: [code, cityKnown && (row.city_zh_name || row.locality_name)].filter(Boolean).join(' · ')
+      }
+    };
+  });
+  return {
+    options: items.map(({ option }) => option), total: options.length, availableTotal: options.length,
+    nextCursor: offset + items.length < options.length ? String(offset + items.length) : undefined, source: 'postgres'
   };
 };
 
-const locationCatalogCache = new WeakMap<Database, Map<string, { expiresAt: number; promise: Promise<CatalogPage> }>>();
-const catalogCacheKey = (input: CatalogQuery): string => JSON.stringify([
-  input.country, input.field, input.query || '', input.region || '', input.regionId || '', input.cityId || '', input.city || '',
-  Boolean(input.residential), input.cursor || '', input.limit ?? null
-]);
-
 export const invalidateLocationCatalogCache = (db: Database): void => {
-  locationCatalogCache.delete(db);
+  snapshotStore.delete(db);
 };
 
 export const queryLocationCatalog = async (db: Database, input: CatalogQuery): Promise<CatalogPage> => {
   if (input.field === 'district' && input.country !== 'CN') return { ...emptyPage, revision: '' };
-  const revision = await db.prepare('SELECT version FROM address_pool_revisions WHERE kind=?')
-    .bind(`generation:${input.country}`).first<string>('version');
-  const key = `${catalogCacheKey(input)}:${revision || ''}`;
-  let cache = locationCatalogCache.get(db);
-  if (!cache) {
-    cache = new Map();
-    locationCatalogCache.set(db, cache);
-  }
-  const cached = cache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.promise;
+  const currentRevision = await db.prepare('SELECT version FROM address_pool_revisions WHERE kind=?')
+    .bind(`generation:${input.country}`).first<string>('version') || '';
   const limit = normalizeLimit(input.limit, 200);
   const offset = normalizeOffset(input.cursor);
-  const pagePromise = input.field === 'region' ? queryRegions(db, input, limit, offset)
-    : input.field === 'city' ? (input.country === 'CN' ? queryChinaCities(db, input, limit, offset) : queryCities(db, input, limit, offset))
-      : input.field === 'district' ? queryDistricts(db, input, limit, offset)
-        : queryPostcodes(db, input, limit, offset);
-  const promise = pagePromise.then((page) => ({ ...page, revision: revision || '' }));
-  cache.set(key, { expiresAt: Number.POSITIVE_INFINITY, promise });
-  if (cache.size > 500) {
-    const now = Date.now();
-    for (const [candidate, value] of cache) if (value.expiresAt <= now) cache.delete(candidate);
-    while (cache.size > 500) cache.delete(cache.keys().next().value!);
+  const residential = Boolean(input.residential);
+  if (input.field === 'postcode') {
+    const { value, revision } = await loadSnapshot(db, `${input.country}:${residential}:postcode`, currentRevision,
+      () => buildPostcodeSnapshot(db, input.country, residential));
+    return { ...await queryPostcodes(db, input, value, limit, offset), revision };
   }
-  void promise.then(() => {
-    const current = cache?.get(key);
-    if (current?.promise === promise) current.expiresAt = Date.now() + 30_000;
-  }, () => {
-    if (cache?.get(key)?.promise === promise) cache.delete(key);
-  });
-  return promise;
+  const china = input.country === 'CN';
+  const { value, revision } = await loadSnapshot(db, china ? 'CN:admin' : `${input.country}:${residential}:admin`, currentRevision,
+    () => china ? buildChinaAdminSnapshot(db) : buildAdminSnapshot(db, input.country, residential));
+  const page = input.field === 'region' ? pageOf(searched(value.regions, input.query, lowerKey), limit, offset)
+    : input.field === 'city' ? (china ? queryChinaCities(input, value, limit, offset) : await queryCities(db, input, value, limit, offset))
+      : await queryDistricts(db, input, value, limit, offset);
+  return { ...page, revision };
 };
+
+// Builds every country's snapshots one at a time so the first visitor of a country does not wait for the grouping.
+export const prewarmLocationCatalog = async (db: Database, targets: Array<{ country: CountryCode; postcode: boolean }>): Promise<void> => {
+  for (const { country, postcode } of targets) {
+    const residential = country === 'CN';
+    await queryLocationCatalog(db, { country, field: 'region', residential }).catch(() => undefined);
+    if (postcode) await queryLocationCatalog(db, { country, field: 'postcode', residential }).catch(() => undefined);
+  }
+};
+
 
 export const recordResidentialCoverage = async (
   db: Database | undefined,

@@ -19,7 +19,7 @@ import {
   type AddressFilters
 } from './repositories/address-repository';
 import { loadAddressPoolV2AddressById, pickAddressPoolV2Address, pickNearestAddressPoolV2Address } from './repositories/address-pool-v2';
-import { CN_SYNTHETIC_CITY_PREFIX, decodeSyntheticCityId, decodeSyntheticDistrictId, queryLocationCatalog, type CatalogField } from './repositories/location-catalog';
+import { CN_SYNTHETIC_CITY_PREFIX, decodeSyntheticCityId, decodeSyntheticDistrict, queryLocationCatalog, type CatalogField } from './repositories/location-catalog';
 import { countChinaCommunities, loadChinaCommunityAddressById, pickChinaCommunityAddress } from './repositories/china-community';
 import { isTranslatableLocale, translateAddressComponents } from './services/address-translation';
 import { clientContextFromRequest } from './services/client-context';
@@ -425,10 +425,6 @@ app.get('/api/v1/client-context', async (context) => {
   return context.json({ data });
 });
 
-// Filter option lists change only as addresses are published; a short server and browser cache makes reopening
-// a filter instant while counts stay at most a few minutes old.
-const LOCATION_CACHE_MS = 120_000;
-const locationResponseCache = new Map<string, { expiresAt: number; data: Record<string, unknown>; revision: string }>();
 app.get('/api/v1/locations/search', async (context) => {
   const country = context.req.query('country')?.toUpperCase() || 'US';
   if (!isCountryCode(country)) throw new DomainError('INVALID_COUNTRY', `Unknown country code: ${country}`);
@@ -446,13 +442,6 @@ app.get('/api/v1/locations/search', async (context) => {
   const limit = Number.parseInt(context.req.query('limit') || '100', 10);
   const residential = context.req.query('residential') === 'true';
   if (context.env.LOCATION_DB) {
-    const cacheKey = JSON.stringify([config.code, field, query, region, regionId, cityId, city, residential, cursor, limit]);
-    const cachedLocations = locationResponseCache.get(cacheKey);
-    if (cachedLocations && cachedLocations.expiresAt > Date.now()) {
-      context.header('X-Address-Catalog-Revision', cachedLocations.revision);
-      context.header('Cache-Control', 'public, max-age=300, stale-while-revalidate=3600');
-      return context.json({ data: cachedLocations.data });
-    }
     const catalog = await queryLocationCatalog(context.env.LOCATION_DB, {
       country: config.code,
       field,
@@ -477,8 +466,6 @@ app.get('/api/v1/locations/search', async (context) => {
       revision: catalog.revision || '',
       source: catalog.source
     };
-    locationResponseCache.set(cacheKey, { expiresAt: Date.now() + LOCATION_CACHE_MS, data: responseData, revision: catalog.revision || '' });
-    while (locationResponseCache.size > 2000) locationResponseCache.delete(locationResponseCache.keys().next().value!);
     context.header('X-Address-Catalog-Revision', catalog.revision || '');
     context.header('Cache-Control', 'public, max-age=300, stale-while-revalidate=3600');
     return context.json({ data: responseData });
@@ -605,17 +592,17 @@ app.get('/api/v1/generate', async (context) => {
     throw new DomainError('INVALID_LOCATION', 'The selected city ID does not match the requested location.', 400);
   }
   const districtId = context.req.query('districtId') || undefined;
-  const districtFromId = decodeSyntheticDistrictId(districtId);
+  const districtFromId = decodeSyntheticDistrict(districtId);
   if (districtId && (!districtFromId || countryCode !== 'CN')) {
     throw new DomainError('INVALID_LOCATION', 'The selected district ID is not present in the location catalog.', 400);
   }
   const requestedFilters: AddressFilters = {
     q: context.req.query('q') || undefined,
-    region: context.req.query('region') || undefined,
+    region: context.req.query('region') || districtFromId?.province,
     regionId: context.req.query('regionId') || undefined,
-    city: context.req.query('city') || cityFromId,
+    city: context.req.query('city') || cityFromId || districtFromId?.city,
     cityId,
-    district: context.req.query('district') || districtFromId,
+    district: context.req.query('district') || districtFromId?.district,
     districtId,
     postcode: context.req.query('postcode') || undefined,
     postcodeId: context.req.query('postcodeId') || undefined
@@ -643,8 +630,10 @@ app.get('/api/v1/generate', async (context) => {
   try {
     const syntheticCity = !ipRegionMode && cityFromId;
     const catalogFilters = syntheticCity ? { ...filters, city: undefined, cityId: undefined } : filters;
-    const lookupRequired = syntheticCity
-      ? Boolean(filters.region || filters.regionId || filters.postcode || filters.postcodeId) : hasLocationFilter;
+    // Districts are matched by the pool itself; without a region, city or postcode there is nothing to resolve
+    // in the catalog, and resolving anyway would pick an unrelated city.
+    const lookupRequired = Boolean(filters.region || filters.regionId || filters.postcode || filters.postcodeId
+      || (!syntheticCity && (filters.city || filters.cityId)));
     const nearestCatalog = ipRegionMode && ipCoordinates && context.env.LOCATION_DB
       ? await resolveNearestCatalogTarget(context.env.LOCATION_DB, country.code, ipCoordinates)
       : undefined;

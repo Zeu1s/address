@@ -470,6 +470,46 @@ try {
     assert.equal(await page.locator('input[role=combobox]').nth(0).inputValue(), '');
     assert.equal(await page.locator('input[role=combobox]').nth(1).inputValue(), '');
   });
+  await check('a typed district is chosen with its city and province and stays marked when reopened', async (page) => {
+    const districts = Array.from({ length: 300 }, (_, index) => ({ id: `d${index}`, value: `测试区${index}`, label: `测试区${index}`,
+      en: `Fixture District ${index}`, zhCN: `测试区${index}`, availableCount: 1, parentId: '9', parentValue: '测试市', regionId: '8', regionValue: '测试省' }));
+    districts[250] = { id: 'fengrun', value: '丰润区', label: '丰润区', en: 'Fengrun District', zhCN: '丰润区', availableCount: 28,
+      parentId: '20172', parentValue: '唐山市', parentLabel: '唐山市 · 河北省', regionId: '2280', regionValue: '河北省' };
+    const generated = [];
+    await mount(page, { web: async (route, path, url) => {
+      if (path === '/availability') { await fulfill(route, [{ code: 'CN', available: true, residentialAvailable: true }]); return true; }
+      if (path === '/generate') { generated.push(Object.fromEntries(url.searchParams)); await fulfill(route, {}, 404); return true; }
+      if (path !== '/locations/search') return;
+      const field = url.searchParams.get('field');
+      const query = (url.searchParams.get('q') || '').toLowerCase();
+      const choices = field === 'district' ? districts.filter((option) => !query || option.en.toLowerCase().includes(query))
+        : field === 'city' ? [{ id: '20172', value: '唐山市', label: '唐山市', en: 'Tangshan', zhCN: '唐山市', availableCount: 28, regionId: '2280', regionValue: '河北省' }]
+          : [{ id: '2280', value: '河北省', label: '河北省', en: 'Hebei', zhCN: '河北省', availableCount: 28 }];
+      await fulfill(route, { regions: [], cities: [], postcodes: [], districts: [], [`${field === 'city' ? 'citie' : field}s`]: choices.slice(0, 200),
+        total: choices.length, availableTotal: choices.length, nextCursor: choices.length > 200 ? '200' : undefined });
+      return true;
+    } });
+    await page.goto(`${baseUrl}/en/?country=cn`); await hydrated(page);
+    const [region, city, district] = [0, 1, 2].map((index) => page.locator('input[role=combobox]').nth(index));
+    await district.click();
+    await district.fill('fengrun');
+    await page.getByRole('option', { name: /Fengrun District/u }).waitFor();
+    await district.press('Enter');
+    assert.equal(await district.inputValue(), 'Fengrun District');
+    assert.equal(await city.inputValue(), 'Tangshan');
+    assert.equal(await region.inputValue(), 'Hebei');
+    generated.length = 0;
+    await page.locator('.generate-button').click();
+    await page.waitForFunction(() => document.querySelector('.compact-error'));
+    assert.deepEqual([generated.at(-1)?.district, generated.at(-1)?.city, generated.at(-1)?.region], ['丰润区', '唐山市', '河北省']);
+    await district.click();
+    const selected = page.locator('.combobox-popup [role=option][aria-selected=true]');
+    await selected.waitFor();
+    assert.match(await selected.innerText(), /Fengrun District/u);
+    await district.fill('fixture district 1');
+    await district.press('Escape');
+    assert.equal(await district.inputValue(), 'Fengrun District');
+  });
   await check('desktop and mobile generator/admin pages stay inside the viewport', async (page) => {
     await mount(page);
     for (const width of [1280, 390]) {
