@@ -69,4 +69,14 @@ describe('publication preservation during source refresh', () => {
       expect(await database.prepare("SELECT COUNT(*) AS total FROM address_pool_evidence WHERE is_primary=1 AND evidence_type='address_existence'").first('total')).toBe(3);
     } finally { await database.close(); }
   });
+
+  it('keeps one primary evidence row when a reimported dataset renames the source record of an address', async () => {
+    const { database, run } = await fixture();
+    try {
+      await run([record(12)], 'v1');
+      await run([{ ...record(12), id: 'fixture-12-renamed' }], 'v1');
+      expect(await database.prepare(`SELECT COUNT(*) AS total FROM address_pool_evidence
+        WHERE is_primary=1 AND is_current=1 AND evidence_type='address_existence'`).first('total')).toBe(1);
+    } finally { await database.close(); }
+  });
 });

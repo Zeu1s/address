@@ -23,6 +23,6 @@ export interface Database {
   prepare(query: string): PreparedStatement;
   batch<T = Record<string, unknown>>(statements: PreparedStatement[]): Promise<Array<DatabaseResult<T>>>;
   exec(query: string): Promise<{ count: number; duration: number }>;
-  transaction<T>(work: (database: Database) => Promise<T>): Promise<T>;
+  transaction<T>(work: (database: Database) => Promise<T>, options?: { signal?: AbortSignal }): Promise<T>;
   close(): void | Promise<void>;
 }

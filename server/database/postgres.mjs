@@ -636,7 +636,7 @@ export class PostgresDatabase {
     return { count: result.rowCount || 0, duration: performance.now() - startedAt };
   }
 
-  async transaction(work) {
+  async transaction(work, { signal } = {}) {
     if (this.transactions.getStore()?.active) {
       throw new Error('PostgreSQL transaction is already active');
     }
@@ -667,12 +667,23 @@ export class PostgresDatabase {
     this.activeTransactions.add(transaction);
     let started = false;
     let discard = false;
+    // Cancelling the caller also cancels the statement running on this connection; checks between statements alone
+    // left long imports running for minutes after a job was cancelled.
+    let cancelStatement;
     try {
       if (transaction.closing) throw databaseClosedError();
+      signal?.throwIfAborted();
       await client.query('BEGIN');
       started = true;
       transaction.started = true;
       transaction.active = true;
+      if (signal) {
+        const pid = (await client.query('SELECT pg_backend_pid() AS pid').catch(() => null))?.rows?.[0]?.pid;
+        if (pid) {
+          cancelStatement = () => { this.pool.query('SELECT pg_cancel_backend($1)', [pid]).catch(() => {}); };
+          signal.addEventListener('abort', cancelStatement, { once: true });
+        }
+      }
       return await this.transactions.run(transaction, async () => {
         if (transaction.closing) throw databaseClosedError();
         const result = await work(this);
@@ -688,6 +699,7 @@ export class PostgresDatabase {
       else if (!started) discard = true;
       throw error;
     } finally {
+      if (cancelStatement) signal.removeEventListener('abort', cancelStatement);
       transaction.active = false;
       this.activeTransactions.delete(transaction);
       transaction.release(discard || transaction.closing);

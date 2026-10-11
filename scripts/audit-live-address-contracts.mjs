@@ -106,7 +106,9 @@ const issueFor = (code, address) => {
   if (!address.addressVariants?.native || !en || !zh) issues.push('missing_language_variant');
   if (nativePatterns[code] && (!nativeComponents.length || nativeComponents.some((value) => !nativePatterns[code].test(value)))) issues.push('native_script');
   if (forbiddenNativeLatin.has(code) && nativeComponents.some(hasNonIdentifierLatin)) issues.push('native_latin_mixed');
-  if (toTraditional[code] && nativeComponents.some((value) => toTraditional[code](value) !== value)) issues.push('native_not_traditional');
+  // OpenCC turns 里 into 裏, but 里 is the official character of lane names (天樂里, Tin Lok Lane).
+  const lane = (value) => value.replace(/裏/gu, '里');
+  if (toTraditional[code] && nativeComponents.some((value) => lane(toTraditional[code](value)) !== lane(value))) issues.push('native_not_traditional');
   if (!latin.test(en)) issues.push('english_missing_latin');
   if (englishComponents.some((value) => foreignEnglishScript.test(value))) issues.push('english_source_script');
   if (!/\p{Script=Han}/u.test(zh) || !chineseComponents.some((value) => /\p{Script=Han}/u.test(value))) issues.push('zh_missing_han');

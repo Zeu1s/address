@@ -77,9 +77,11 @@ export const sourceAdapterRevisions = Object.freeze({
   'france-bdnb-residential': `${franceBdnbExportRevision}+${capacityRevision}`,
   'spain-catastro-residential': `${spainCatastroExportRevision}+${capacityRevision}`,
   'taiwan-residential': `${taiwanResidentialExportRevision}+${capacityRevision}`,
-  'hong-kong-residential': `${hongKongResidentialExportRevision}+${capacityRevision}`,
+  // Discovery markers: the catalogue API (HK) and the top-level OGC `updated` field (NL) reach sources that earlier
+  // discovery could not, so only these sources leave their latched failures.
+  'hong-kong-residential': `${hongKongResidentialExportRevision}+${capacityRevision}+ckan-discovery`,
   'mappls-residential': mapplsResidentialRevision,
-  'pdok-bag': `${pdokBagRevision}+${capacityRevision}`
+  'pdok-bag': `${pdokBagRevision}+${capacityRevision}+ogc-updated`
 });
 
 export const adminBoundaryRevision = (countryCode) => {
@@ -996,8 +998,10 @@ export const createSourceAdapters = ({
       return archives;
     })().catch((error) => { usaStructuresIndexPromise = null; throw error; });
     const archive = (await usaStructuresIndexPromise).get(shard.partitionName);
-    if (!archive) throw new Error(`USA Structures has no archive for ${shard.admin1}`);
-    return archive;
+    // One state without an archive keeps its Overture addresses; residential evidence then comes from Overture
+    // Buildings instead of failing the whole country run.
+    if (!archive) console.warn(`USA Structures has no archive for ${shard.admin1}`);
+    return archive || null;
   };
 
   const discoverOverture = async (shard, { includeAssetSizes = false } = {}) => {
@@ -1695,12 +1699,24 @@ export const createSourceAdapters = ({
       throw new Error(`Hong Kong source metadata request failed (${metadataResponse.status})`);
     }
     const metadata = await metadataResponse.text();
-    const dataUrl = metadata.match(/https:\/\/static\.csdi\.gov\.hk\/csdi-webpage\/download\/[a-f\d]+\/csv/iu)?.[0];
-    const date = metadata.match(/Last updated on[\s\S]{0,500}?(\d{2})\/(\d{2})\/(\d{4})/iu);
-    if (!dataUrl || !date) throw new Error('Hong Kong source metadata is missing the download URL or update date');
+    const downloadPattern = /^https:\/\/static\.csdi\.gov\.hk\/csdi-webpage\/download\/[a-f\d]+\/csv$/iu;
+    let dataUrl;
+    let publishedAt;
+    // The DATA.GOV.HK catalogue API keeps a stable dataset id while resources are replaced; resource pages are not.
+    if (shard.source.metadataUrl.includes('/api/3/action/package_show')) {
+      const resource = JSON.parse(metadata)?.result?.resources
+        ?.find((entry) => entry.state === 'active' && downloadPattern.test(String(entry.url || '')));
+      const updated = Date.parse(resource?.metadata_modified || resource?.created || '');
+      dataUrl = resource?.url;
+      publishedAt = Number.isFinite(updated) ? `${new Date(updated).toISOString().slice(0, 10)}T00:00:00.000Z` : undefined;
+    } else {
+      const date = metadata.match(/Last updated on[\s\S]{0,500}?(\d{2})\/(\d{2})\/(\d{4})/iu);
+      dataUrl = metadata.match(/https:\/\/static\.csdi\.gov\.hk\/csdi-webpage\/download\/[a-f\d]+\/csv/iu)?.[0];
+      publishedAt = date ? `${date[3]}-${date[2]}-${date[1]}T00:00:00.000Z` : undefined;
+    }
+    if (!dataUrl || !publishedAt) throw new Error('Hong Kong source metadata is missing the download URL or update date');
     const response = await fetchHead(dataUrl);
     if (!response.ok) throw new Error(`Hong Kong source request failed (${response.status})`);
-    const publishedAt = `${date[3]}-${date[2]}-${date[1]}T00:00:00.000Z`;
     return {
       adapter: 'hong-kong-residential',
       version: `${publishedAt.slice(0, 10)}-${hongKongResidentialExportRevision}`,
@@ -1740,7 +1756,8 @@ export const createSourceAdapters = ({
     const metadata = await fetchJson(shard.source.dataUrl);
     const itemLink = metadata?.links?.find((link) => link.rel === 'items'
       && /(?:application\/geo\+json|application\/json)/iu.test(String(link.type || '')));
-    const updated = metadata?.links?.find((link) => link.rel === 'self')?.updated;
+    // OGC API collections carry `updated` at the top level; older PDOK responses put it on the self link.
+    const updated = metadata?.updated || metadata?.links?.find((link) => link.rel === 'self')?.updated;
     if (!itemLink?.href || !updated || !Number.isFinite(Date.parse(updated))) {
       throw new SourceMetadataError('PDOK BAG collection metadata is incomplete', {
         url: shard.source.dataUrl, code: 'SOURCE_METADATA_INVALID'

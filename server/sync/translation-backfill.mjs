@@ -10,6 +10,7 @@ import { refreshCountryCounts } from '../database/published-pool.mjs';
 import { refreshResidentialCoverage } from '../database/residential-coverage.mjs';
 import { administrativeAssignmentJoin, projectAdministrativeRow, refreshAdministrativeAssignments } from '../database/administrative-assignments.mjs';
 import { createBackfillProviders, readBackfillProgress, writeBackfillProgress } from './translation-providers.mjs';
+import { staleCoverage } from './stale-coverage.mjs';
 
 const clean = (value) => String(value ?? '').trim();
 const integer = (value, fallback, max) => Math.min(max, Math.max(1, Number.parseInt(value, 10) || fallback));
@@ -149,7 +150,7 @@ const CHINESE_FALLBACK_RETRY_MS = 6 * 60 * 60_000;
 const DEFERRED_STREET_BACKLOG = 200;
 const TERMINAL_FAILURE_REASONS = ['translation_or_publication_rejected', 'retry_limit', 'publication_timeout', 'publication_conflict'];
 const coverageRefreshedAt = new Map();
-const staleCoverage = new Set();
+
 export const refreshStaleCoverage = async (database, now, { force = false } = {}) => {
   // One country per cycle keeps the table lock short and leaves the rest of the cycle to publication.
   const due = [...staleCoverage]

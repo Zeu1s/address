@@ -725,7 +725,9 @@ export class PostgresAddressImporter {
           WHERE is_primary=1 AND address_id IN (
             SELECT address_id FROM address_pool_evidence WHERE dataset_id=? AND evidence_type='address_existence'
           )`).bind(datasetId),
-        this.database.prepare("UPDATE address_pool_evidence SET is_primary=1,is_current=1 WHERE dataset_id=? AND evidence_type='address_existence'").bind(datasetId),
+        // Primary flags are chosen per address below; one address can carry several source records in a dataset,
+        // and flagging them all broke the one-primary-per-address index.
+        this.database.prepare("UPDATE address_pool_evidence SET is_current=1 WHERE dataset_id=? AND evidence_type='address_existence'").bind(datasetId),
         this.database.prepare(`UPDATE address_pool_evidence SET is_primary=0,is_current=0
           WHERE dataset_id IN (
             SELECT id FROM address_datasets WHERE source_id=? AND country_code=? AND id<>? AND status IN ('pending','active')
@@ -863,7 +865,7 @@ export class PostgresAddressImporter {
         addedCount += Number(await this.database.prepare(`SELECT COUNT(*) AS total FROM address_pool
           WHERE active=1 AND id IN (${ids.map(() => '?').join(',')})`).bind(...ids).first('total') || 0);
       }
-    });
+    }, { signal });
     const residentialCount = localized.filter((record) => record.propertyType === 'residential' || record.propertyType === 'apartment').length;
     return {
       datasetId, acceptedCount: localized.length, rejectedCount, localityCount: localityCounts.size,

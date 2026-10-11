@@ -120,6 +120,22 @@ describe('PDOK BAG residential source', () => {
     expect(await readdir(join(cacheDir, 'raw'))).toEqual([]);
   });
 
+  it('reads the collection update time from the top level of current OGC API metadata', async () => {
+    const fetchImpl = vi.fn(async (input) => {
+      const url = new URL(String(input));
+      return new Response(JSON.stringify({
+        updated: '2026-10-10T00:00:00Z',
+        links: [
+          { rel: 'self', type: 'application/json', href: url.href },
+          { rel: 'items', type: 'application/geo+json', href: `${url.origin}${url.pathname}/items?f=json` }
+        ]
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const discovery = await createSourceAdapters({ fetchImpl, loadSeedLocations: async () => [], environment: {} }).discover(shard);
+    expect(discovery).toMatchObject({ adapter: 'pdok-bag', publishedAt: '2026-10-10T00:00:00.000Z' });
+    expect(discovery.version).toMatch(/^2026-10-10-/u);
+  });
+
   it('visits every dispersed seed before requesting a deeper page', async () => {
     const cacheDir = await mkdtemp(join(tmpdir(), 'pdok-bag-round-robin-'));
     directories.push(cacheDir);

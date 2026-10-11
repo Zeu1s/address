@@ -644,6 +644,22 @@ describe('address source shard catalog', () => {
     expect(exporter).toContain('ST_DWithin(address_candidates.geometry, structures.geometry, 0.0003)');
   });
 
+  it('keeps a US state without a USA Structures archive instead of failing the country', async () => {
+    const fetchImpl = async (input) => {
+      const url = String(input);
+      if (url.endsWith('/catalog.json')) return Response.json({ latest: '2026-09-23.1' });
+      if (url.endsWith('/collection.json')) return Response.json({ links: [{ rel: 'item', href: './00000.json' }] });
+      if (url.startsWith('https://fema-femadata.s3.amazonaws.com/')) {
+        return new Response('<Key>Partners/ORNL/USA_Structures/Mississippi/MS_Structures_20260913.zip</Key>');
+      }
+      return Response.json({ bbox: [-170, 50, -130, 72], assets: { aws: { href: 'https://example.test/address.parquet' } } });
+    };
+    const shard = (await loadSourceCatalog(undefined, {})).shards.find((value) => value.id === 'overture-usa-structures-ak');
+    const discovery = await createSourceAdapters({ fetchImpl, environment: {} }).discover(shard);
+    expect(discovery.structuresUrl ?? null).toBeNull();
+    expect(discovery.version).not.toContain('usa-structures');
+  });
+
   it('reads one or many OpenAddresses archive members with cross-member deduplication', async () => {
     const cacheDir = resolve('.data-cache', `openaddresses-members-${process.pid}-${Date.now()}`);
     directories.push(cacheDir);
@@ -1445,15 +1461,15 @@ describe('address source shard catalog', () => {
     directories.push(cacheDir);
     const catalog = await loadSourceCatalog();
     const shard = catalog.shards.find((entry) => entry.id === 'hong-kong-official-residential');
-    expect(shard.source.dataUrl).toBe(shard.source.metadataUrl);
+    expect(shard.source.metadataUrl).toBe('https://data.gov.hk/en-data/api/3/action/package_show?id=hk-bd-opendata-building-information');
     const dataUrl = 'https://static.csdi.gov.hk/csdi-webpage/download/0123456789abcdef/csv';
     const calls = [];
     const fetchImpl = async (input, init = {}) => {
       const url = String(input);
-      if (url === shard.source.metadataUrl) return new Response(`
-        <a href="${dataUrl}">CSV</a>
-        <div>Last updated on</div><div>14/07/2026</div>
-      `);
+      if (url === shard.source.metadataUrl) return Response.json({ success: true, result: { resources: [
+        { state: 'deleted', url: 'https://static.csdi.gov.hk/csdi-webpage/download/ffffffffffffffff/csv', metadata_modified: '2026-08-01T00:00:00' },
+        { state: 'active', format: 'CSV', url: dataUrl, metadata_modified: '2026-07-14T16:30:38.156769' }
+      ] } });
       if (init.method === 'HEAD' && url === dataUrl) {
         return new Response(null, { status: 200, headers: { 'content-length': '9' } });
       }

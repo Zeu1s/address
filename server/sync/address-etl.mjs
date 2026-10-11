@@ -26,6 +26,7 @@ import { findNonResidentialMatch } from '../../src/domain/non-residential.mjs';
 import { matchesCustomBlacklist } from '../lib/custom-blacklist.mjs';
 import { ADDRESS_POLICY_DEFAULTS, getRuntimePolicy, loadImportPolicy } from './address-policy.mjs';
 import { addressCanonicalKey, normalizeAddressFacts, streetAddressKey } from '../../src/domain/address-quality.mjs';
+import { staleCoverage } from './stale-coverage.mjs';
 
 const syncRoot = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const defaultCacheDir = resolve(syncRoot, '../../.data-cache/address-sync');
@@ -1176,8 +1177,16 @@ export const runAddressEtl = async ({
           .catch((error) => { if (signal?.aborted) throw error; console.error(`[address-sync] ${countryCode} postcode inference failed`, error?.message || error); return null; });
         if (postcodes?.checked) console.log(JSON.stringify({ event: 'postcode_inference', ...postcodes }));
         await reportProgress({ phase: 'coverage', countryCode });
-        const coverage = await refreshResidentialCoverage(database, countryCode, checkedAt.toISOString(), signal);
-        console.log(`[address-sync] ${countryCode} coverage mapped=${coverage.matchedAddresses} unmatched=${coverage.unmatchedAddresses}`);
+        // The import is committed by now; coverage is derived and refreshed again by the background coverage pass,
+        // so a lock timeout here must not turn a successful import into a failed run.
+        const coverage = await refreshResidentialCoverage(database, countryCode, checkedAt.toISOString(), signal)
+          .catch((error) => {
+            if (signal?.aborted) throw error;
+            console.error(`[address-sync] ${countryCode} coverage refresh deferred`, error?.code || error?.message || error);
+            staleCoverage.add(countryCode);
+            return null;
+          });
+        if (coverage) console.log(`[address-sync] ${countryCode} coverage mapped=${coverage.matchedAddresses} unmatched=${coverage.unmatchedAddresses}`);
       }
     }
     if (syncErrors.length) {
